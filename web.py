@@ -2872,11 +2872,11 @@ TASK_STATISTICS_HTML = '''
         .header-content { padding: 0 20px; }
         .header-content h1 { margin: 0; font-size: 1.35rem; font-weight: 600; }
         .header-content p { margin: 6px 0 0 0; font-size: 13px; opacity: 0.9; }
-        .module-nav { display: flex; gap: 4px; margin-bottom: 20px; background: white; border-radius: 5px; padding: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.06); width: fit-content; flex-wrap: wrap; }
-        .module-nav a { padding: 10px 22px; text-decoration: none; color: #555; border-radius: 4px; font-weight: 500; font-size: 14px; }
+        .module-nav { display: flex; gap: 4px; margin-bottom: 20px; background: white; border-radius: 5px; padding: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.06); width: fit-content; flex-wrap: wrap; max-width: 100%; }
+        .module-nav a { padding: 10px 22px; text-decoration: none; color: #555; border-radius: 4px; font-weight: 500; font-size: 14px; white-space: nowrap; }
         .module-nav a.active { background: #3498db; color: white; }
         .module-nav a:not(.active):hover { background: #ecf0f1; color: #2c3e50; }
-        .dim-nav { display: flex; gap: 4px; margin-top: 14px; flex-wrap: wrap; background: #f8fafc; border: 1px solid #e8edf3; border-radius: 5px; padding: 5px; width: fit-content; }
+        .dim-nav { display: flex; gap: 4px; margin-top: 14px; flex-wrap: wrap; background: #f8fafc; border: 1px solid #e8edf3; border-radius: 5px; padding: 5px; width: fit-content; max-width: 100%; }
         .dim-nav a { padding: 8px 16px; text-decoration: none; color: #555; border-radius: 4px; font-size: 13px; font-weight: 500; }
         .dim-nav a.active { background: #3498db; color: white; }
         .dim-nav a:not(.active):hover { background: #ecf0f1; color: #2c3e50; }
@@ -2913,6 +2913,16 @@ TASK_STATISTICS_HTML = '''
             .filters { grid-template-columns: 1fr; }
             .chart-row { grid-template-columns: 1fr; }
             .summary-grid { grid-template-columns: repeat(2, minmax(140px, 1fr)); }
+        }
+        @media (max-width: 700px) {
+            body { padding: 10px; }
+            .container { max-width: 100%; }
+            .card { padding: 14px; }
+            .module-nav { width: 100%; }
+            .module-nav a { padding: 8px 14px; font-size: 13px; }
+            .summary-grid { grid-template-columns: repeat(2, 1fr); }
+            table { font-size: 13px; }
+            th, td { padding: 8px 8px; }
         }
     </style>
 </head>
@@ -3634,6 +3644,22 @@ ACCOUNT_MANAGEMENT_HTML = '''
         .alert-success { background-color: #dff0d8; color: #3c763d; border: 1px solid #d6e9c6; }
         .alert-danger { background-color: #f2dede; color: #a94442; border: 1px solid #ebccd1; }
         .alert-warning { background-color: #fcf8e3; color: #8a6d3b; border: 1px solid #faebcc; }
+        .acct-cards { display: none; }
+        .acct-card { background: white; border-radius: 8px; padding: 14px; margin-bottom: 10px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
+        .acct-card-name { font-weight: 600; font-size: 15px; color: #1f2937; margin-bottom: 6px; }
+        .acct-card-meta { font-size: 13px; color: #6b7280; margin-bottom: 10px; line-height: 1.8; }
+        .acct-card-forms { display: flex; flex-direction: column; gap: 8px; }
+        .acct-card-forms form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+        .acct-card-forms select { padding: 6px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }
+        @media (max-width: 700px) {
+            body { padding: 10px; }
+            .container { max-width: 100%; }
+            .module-nav { width: 100%; overflow-x: auto; }
+            .module-nav a { padding: 8px 14px; font-size: 13px; white-space: nowrap; }
+            .card { padding: 14px; }
+            table.acct-table { display: none; }
+            .acct-cards { display: block; }
+        }
     </style>
 </head>
 <body>
@@ -3663,7 +3689,7 @@ ACCOUNT_MANAGEMENT_HTML = '''
 
         <div class="card">
             <h2 style="margin-top: 0;">账号权限列表</h2>
-            <table>
+            <table class="acct-table">
                 <tr>
                     <th>ID</th>
                     <th>账号</th>
@@ -3713,6 +3739,45 @@ ACCOUNT_MANAGEMENT_HTML = '''
                 </tr>
                 {% endfor %}
             </table>
+
+            <!-- 手机端账号卡片列表 -->
+            <div class="acct-cards">
+                {% for u in users %}
+                <div class="acct-card">
+                    <div class="acct-card-name">{{ u.username }}{% if u.real_name %} · {{ u.real_name }}{% endif %}</div>
+                    <div class="acct-card-meta">
+                        手机：{{ u.phone or '-' }}<br>
+                        绑定员工：{{ u.bound_staff_name or '未绑定' }}<br>
+                        权限：{{ u.role_level }} · {{ '启用' if u.status == 1 else '禁用' }}<br>
+                        创建：{{ u.create_time }}
+                    </div>
+                    <div class="acct-card-forms">
+                        <form method="post" action="{{ url_for('update_account_permission', user_id=u.id) }}">
+                            <select name="role_level" title="权限等级">
+                                <option value="1" {% if u.role_level == 1 %}selected{% endif %}>1-普通</option>
+                                <option value="2" {% if u.role_level == 2 %}selected{% endif %}>2-派发</option>
+                                <option value="3" {% if u.role_level >= 3 %}selected{% endif %}>3-管理员</option>
+                            </select>
+                            <select name="status" title="账号状态">
+                                <option value="1" {% if u.status == 1 %}selected{% endif %}>启用</option>
+                                <option value="0" {% if u.status != 1 %}selected{% endif %}>禁用</option>
+                            </select>
+                            <button type="submit" class="btn">保存</button>
+                        </form>
+                        <form method="post" action="{{ url_for('bind_account_staff', user_id=u.id) }}">
+                            <select name="staff_id" title="绑定员工" style="flex:1;min-width:0;">
+                                <option value="">不绑定</option>
+                                {% for s in staff_list %}
+                                <option value="{{ s.staff_id }}" {% if u.staff_id == s.staff_id %}selected{% endif %}>{{ s.full_name }}（{{ s.position }}）</option>
+                                {% endfor %}
+                            </select>
+                            <button type="submit" class="btn">绑定</button>
+                        </form>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+
             <p style="color:#6b7280;font-size:13px;margin-bottom:0;">规则：权限等级3及以上可管理员工信息与账号权限；权限等级2及以上可派单。</p>
         </div>
     </div>
