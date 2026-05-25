@@ -11,6 +11,15 @@ from datetime import datetime, date, timedelta
 from functools import wraps
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
+import cloudinary
+import cloudinary.uploader
+
+cloudinary.config(
+    cloud_name=os.environ.get("CLOUDINARY_CLOUD_NAME", "devpzlgvg"),
+    api_key=os.environ.get("CLOUDINARY_API_KEY", "262731876599449"),
+    api_secret=os.environ.get("CLOUDINARY_API_SECRET", "wEe1TrqGdkieRuwS24viPUDpAz8"),
+    secure=True,
+)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'a_secret_key_for_flask_flash_messages')
@@ -335,47 +344,40 @@ def _parse_legacy_photo_paths(raw):
 
 
 def delete_task_photo_file(rel_path):
-    if not rel_path or ".." in rel_path or rel_path.startswith(("/", "\\")):
-        return
-    base = os.path.normpath(task_upload_base_dir())
-    full = os.path.normpath(os.path.join(base, rel_path))
-    if not full.startswith(base):
+    """删除 Cloudinary 上的图片（public_id 即 rel_path）"""
+    if not rel_path:
         return
     try:
-        if os.path.isfile(full):
-            os.remove(full)
-    except OSError:
+        cloudinary.uploader.destroy(rel_path)
+    except Exception:
         pass
 
 
 def save_uploaded_task_photos(task_id, files_storage_list, max_count=None):
-    """校验并保存至磁盘，返回 [(相对路径, 原始文件名), ...]"""
+    """上传至 Cloudinary，返回 [(public_id, 原始文件名), ...]"""
     saved = []
     limit = max_count if max_count is not None else TASK_PHOTO_MAX_PER_TASK
     if not files_storage_list or limit <= 0:
         return saved
-    base = task_upload_base_dir()
-    dest_dir = os.path.join(base, f"task_{task_id}")
-    os.makedirs(dest_dir, exist_ok=True)
     for f in files_storage_list:
         if not f or not getattr(f, "filename", None):
             continue
         ext = os.path.splitext(f.filename)[1].lower()
         if ext not in TASK_PHOTO_ALLOWED_EXT:
             continue
-        orig = f.filename
-        safe = secure_filename(orig) or "image"
-        unique = f"{uuid.uuid4().hex}_{safe}"
-        full_path = os.path.join(dest_dir, unique)
-        f.save(full_path)
-        if os.path.getsize(full_path) > TASK_PHOTO_MAX_BYTES:
-            try:
-                os.remove(full_path)
-            except OSError:
-                pass
+        data = f.read()
+        if len(data) > TASK_PHOTO_MAX_BYTES:
             continue
-        rel = f"task_{task_id}/{unique}"
-        saved.append((rel, orig))
+        try:
+            result = cloudinary.uploader.upload(
+                data,
+                folder=f"telecom/task_{task_id}",
+                resource_type="image",
+            )
+            public_id = result["public_id"]
+            saved.append((public_id, f.filename))
+        except Exception:
+            continue
         if len(saved) >= limit:
             break
     return saved
@@ -392,12 +394,17 @@ def images_to_json_list(rows):
     out = []
     for r in rows or []:
         fp = r.get("file_path") or ""
+        # fp 存的是 Cloudinary public_id，生成安全 CDN URL
+        try:
+            url = cloudinary.utils.cloudinary_url(fp, secure=True)[0]
+        except Exception:
+            url = ""
         out.append(
             {
                 "image_id": r.get("image_id"),
                 "task_id": r.get("task_id"),
                 "file_path": fp,
-                "url": url_for("serve_task_photo", p=fp),
+                "url": url,
                 "original_filename": r.get("original_filename") or "",
                 "created_at": _format_image_created_at(r.get("created_at")),
             }
@@ -1431,17 +1438,17 @@ def logout():
 
 @app.route("/uploads/task")
 def serve_task_photo():
-    """登录后可访问的工单现场照片（路径参数防穿越）"""
+    """兼容旧链接，重定向到 Cloudinary CDN"""
     if not is_logged_in():
         return redirect(url_for("login", next=request.full_path))
-    rel = request.args.get("p", "").strip().replace("\\", "/")
-    if not rel or ".." in rel or rel.startswith("/"):
+    public_id = request.args.get("p", "").strip()
+    if not public_id:
         abort(404)
-    base = os.path.normpath(task_upload_base_dir())
-    full = os.path.normpath(os.path.join(base, rel))
-    if not full.startswith(base) or not os.path.isfile(full):
+    try:
+        cdn_url = cloudinary.utils.cloudinary_url(public_id, secure=True)[0]
+    except Exception:
         abort(404)
-    return send_file(full)
+    return redirect(cdn_url)
 
 
 def _json_task_images(cursor, task_id):
