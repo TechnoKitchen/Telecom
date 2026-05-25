@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.db
+task_uploads/
+*.xlsx
+*.xls
+output.xlsx
+data.xlsx
+railway_import.sql
