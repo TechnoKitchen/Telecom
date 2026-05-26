@@ -1678,13 +1678,24 @@ def api_staff_location():
         return jsonify({"ok": False, "message": "数据库连接失败"}), 500
     try:
         cur = connection.cursor()
-        cur.execute(
-            "UPDATE staff_basic_info SET latitude=%s, longitude=%s, location_updated_at=NOW() WHERE staff_id=%s",
-            (lat, lng, target_staff_id),
-        )
+        province = data.get("province", "").strip() or None
+        city = data.get("city", "").strip() or None
+        if province or city:
+            cur.execute(
+                """UPDATE staff_basic_info
+                   SET latitude=%s, longitude=%s, location_updated_at=NOW(),
+                       location_province=%s, location_city=%s
+                   WHERE staff_id=%s""",
+                (lat, lng, province, city, target_staff_id),
+            )
+        else:
+            cur.execute(
+                "UPDATE staff_basic_info SET latitude=%s, longitude=%s, location_updated_at=NOW() WHERE staff_id=%s",
+                (lat, lng, target_staff_id),
+            )
         connection.commit()
         cur.close()
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "province": province, "city": city})
     except Exception as e:
         return jsonify({"ok": False, "message": str(e)}), 500
     finally:
@@ -2102,6 +2113,12 @@ def ensure_staff_columns(connection):
     cur.execute("SHOW COLUMNS FROM staff_basic_info LIKE 'location_updated_at'")
     if not cur.fetchone():
         cur.execute("ALTER TABLE staff_basic_info ADD COLUMN location_updated_at DATETIME NULL AFTER longitude")
+    cur.execute("SHOW COLUMNS FROM staff_basic_info LIKE 'location_province'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE staff_basic_info ADD COLUMN location_province VARCHAR(20) NULL AFTER location_updated_at")
+    cur.execute("SHOW COLUMNS FROM staff_basic_info LIKE 'location_city'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE staff_basic_info ADD COLUMN location_city VARCHAR(20) NULL AFTER location_province")
     connection.commit()
     cur.close()
 
@@ -2317,6 +2334,8 @@ def edit_staff(staff_id):
             department_val = department if department else None
             team_name_val = team_name if team_name else None
             home_address_val = request.form.get('home_address', '').strip() or None
+            location_province_val = request.form.get('location_province', '').strip() or None
+            location_city_val = request.form.get('location_city', '').strip() or None
 
             # 更新数据
             cursor.execute('''
@@ -2326,13 +2345,16 @@ def edit_staff(staff_id):
                 education = %s, entry_date = %s, departure_date = %s,
                 is_active = %s, region_id = %s, team_id = %s, team_name = %s,
                 position = %s, department = %s, home_address = %s,
+                location_province = %s, location_city = %s, location_updated_at = IF(%s IS NOT NULL, NOW(), location_updated_at),
                 updated_at = NOW()
             WHERE staff_id = %s
             ''', (
                 full_name, gender, id_card, private_phone, work_phone,
                 emergency_contact, emergency_phone, education_val, entry_date,
                 departure_date_val, is_active, region_id_val, team_id_val, team_name_val,
-                position, department_val, home_address_val, staff_id
+                position, department_val, home_address_val,
+                location_province_val, location_city_val, location_province_val,
+                staff_id
             ))
             
             connection.commit()
@@ -4498,17 +4520,36 @@ EDIT_STAFF_HTML = '''
                 </div>
                 <div class="form-group">
                     <label for="home_address">常驻地址</label>
-                    <input type="text" id="home_address" name="home_address" value="{{ staff.home_address or '' }}" maxlength="200" placeholder="如：XX市XX区XX路XX号">
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                        <select id="province_sel" onchange="updateCities()" style="flex:1;min-width:120px;">
+                            <option value="">选择省份</option>
+                        </select>
+                        <select id="city_sel" onchange="updateHomeAddress()" style="flex:1;min-width:120px;">
+                            <option value="">选择城市</option>
+                        </select>
+                    </div>
+                    <input type="hidden" id="home_address" name="home_address" value="{{ staff.home_address or '' }}">
+                    <small style="color:#6b7280;font-size:12px;">当前：{{ staff.home_address or '未设置' }}</small>
                 </div>
                 <div class="form-group">
-                    <label>实时位置</label>
+                    <label>实时位置（省市）</label>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
+                        <select id="loc_province" onchange="onLocProvinceChange()" style="flex:1;min-width:120px;">
+                            <option value="">选择省份</option>
+                        </select>
+                        <select id="loc_city" onchange="onLocCityChange()" style="flex:1;min-width:120px;">
+                            <option value="">选择城市</option>
+                        </select>
+                    </div>
+                    <input type="hidden" id="location_province" name="location_province" value="{{ staff.location_province or '' }}">
+                    <input type="hidden" id="location_city" name="location_city" value="{{ staff.location_city or '' }}">
                     <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
-                        <button type="button" class="btn btn-primary" onclick="updateGPS()" id="gps-btn">📍 更新当前位置</button>
+                        <button type="button" class="btn btn-primary" onclick="autoLocateProvCity()" id="gps-btn">📍 自动定位省市</button>
                         <span id="gps-status" style="font-size:13px;color:#6b7280;">
-                            {% if staff.latitude and staff.longitude %}
-                            已记录坐标（{{ "%.4f"|format(staff.latitude) }}, {{ "%.4f"|format(staff.longitude) }}）{% if staff.location_updated_at %}，更新于 {{ staff.location_updated_at }}{% endif %}
+                            {% if staff.location_province %}
+                            已记录：{{ staff.location_province }}{{ staff.location_city or '' }}{% if staff.location_updated_at %}（{{ staff.location_updated_at }}）{% endif %}
                             {% else %}
-                            暂无GPS坐标
+                            暂无位置记录
                             {% endif %}
                         </span>
                     </div>
@@ -4532,37 +4573,77 @@ EDIT_STAFF_HTML = '''
         </div>
     </div>
 <script>
-function updateGPS() {
+function autoLocateProvCity() {
     var btn = document.getElementById('gps-btn');
     var status = document.getElementById('gps-status');
     if (!navigator.geolocation) {
         status.textContent = '浏览器不支持定位';
+        status.style.color = '#b91c1c';
         return;
     }
     btn.disabled = true;
     btn.textContent = '定位中...';
+    status.style.color = '#6b7280';
+    status.textContent = '正在获取GPS坐标...';
     navigator.geolocation.getCurrentPosition(function(pos) {
-        fetch('/api/staff/location', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({lat: pos.coords.latitude, lng: pos.coords.longitude, staff_id: {{ staff.staff_id }}})
+        var lat = pos.coords.latitude;
+        var lng = pos.coords.longitude;
+        status.textContent = '正在反查省市...';
+        fetch('https://nominatim.openstreetmap.org/reverse?format=json&lat=' + lat + '&lon=' + lng + '&accept-language=zh-CN', {
+            headers: {'User-Agent': 'TelecomMaintenance/1.0'}
+        }).then(function(r){ return r.json(); }).then(function(geo) {
+            var addr = geo.address || {};
+            var province = addr.state || addr.province || '';
+            var city = addr.city || addr.county || addr.town || addr.village || '';
+            // 去掉"省"/"市"后缀做简化显示
+            province = province.replace(/省$|自治区$|特别行政区$/, '');
+            city = city.replace(/市$/, '');
+            document.getElementById('location_province').value = province;
+            document.getElementById('location_city').value = city;
+            // 同步下拉框显示
+            setSelectValue('loc_province', province);
+            setSelectValue('loc_city', city);
+            return fetch('/api/staff/location', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({lat: lat, lng: lng, staff_id: {{ staff.staff_id }}, province: province, city: city})
+            });
         }).then(function(r){ return r.json(); }).then(function(d) {
+            var prov = document.getElementById('location_province').value;
+            var city = document.getElementById('location_city').value;
             if (d.ok) {
-                status.textContent = '位置已更新（' + pos.coords.latitude.toFixed(4) + ', ' + pos.coords.longitude.toFixed(4) + '）';
+                status.textContent = '已定位：' + (prov || '') + (city || '') + '（点击保存生效）';
                 status.style.color = '#15803d';
             } else {
-                status.textContent = '更新失败：' + d.message;
+                status.textContent = '保存失败：' + d.message;
                 status.style.color = '#b91c1c';
             }
             btn.disabled = false;
-            btn.textContent = '📍 更新当前位置';
+            btn.textContent = '📍 重新定位';
+        }).catch(function(e) {
+            status.textContent = '反查省市失败，请手动选择';
+            status.style.color = '#b91c1c';
+            btn.disabled = false;
+            btn.textContent = '📍 自动定位省市';
         });
     }, function(err) {
-        status.textContent = '定位失败：' + err.message;
+        var msg = {1:'用户拒绝了定位权限', 2:'无法获取位置信息', 3:'定位超时'}[err.code] || err.message;
+        status.textContent = '定位失败：' + msg;
         status.style.color = '#b91c1c';
         btn.disabled = false;
-        btn.textContent = '📍 更新当前位置';
-    });
+        btn.textContent = '📍 自动定位省市';
+    }, {timeout: 10000});
+}
+
+function setSelectValue(id, val) {
+    var sel = document.getElementById(id);
+    if (!sel || !val) return;
+    for (var i = 0; i < sel.options.length; i++) {
+        if (sel.options[i].value === val || sel.options[i].text === val) {
+            sel.selectedIndex = i;
+            return;
+        }
+    }
 }
 </script>
 </body>
