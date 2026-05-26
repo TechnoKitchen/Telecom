@@ -320,9 +320,75 @@ FAULT_BUSINESS_TYPES = ("宽带新装", "宽带修障", "宽带移机", "宽带�
 FAULT_PHENOMENA = ("光衰过大", "ONU离线", "网速不达标", "IPTV卡顿", "WiFi覆盖差", "电话无声", "线路中断", "其他")
 RESOLUTION_METHODS = ("更换光猫", "重新熔纤", "更换尾纤", "重置OLT端口", "更换分光器", "更换网线", "路由器配置", "上门测速", "其他")
 FAULT_TYPES_NEED_PHENOMENON = {"宽带修障", "IPTV修障", "电话修障", "线路维护"}
+FAULT_TYPE_DEPT_MAP = {
+    "宽带新装": "宽带部", "宽带修障": "宽带部", "宽带移机": "宽带部", "宽带提速": "宽带部",
+    "IPTV新装": "IPTV部", "IPTV修障": "IPTV部",
+    "电话新装": "电话部", "电话修障": "电话部",
+    "智能组网": "宽带部", "设备更换": "设备部", "线路维护": "线路部",
+}
 TASK_PHOTO_ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 TASK_PHOTO_MAX_BYTES = 5 * 1024 * 1024
 TASK_PHOTO_MAX_PER_TASK = 20
+
+
+def _haversine_km(lat1, lng1, lat2, lng2):
+    """计算两点间距离（km），使用 Haversine 公式"""
+    import math
+    R = 6371.0
+    d_lat = math.radians(lat2 - lat1)
+    d_lng = math.radians(lng2 - lng1)
+    a = math.sin(d_lat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(d_lng / 2) ** 2
+    return R * 2 * math.asin(math.sqrt(a))
+
+
+def _auto_assign_staff(cursor, fault_type, task_lat, task_lng):
+    """
+    智能派单：综合部门匹配(40%)、距离(30%)、未完成任务数(30%)评分，返回 (staff_id, full_name, dist_km, active_tasks)。
+    无合适员工时返回 (None, None, None, None)。
+    """
+    target_dept = FAULT_TYPE_DEPT_MAP.get(fault_type or "", "")
+    cursor.execute("""
+        SELECT s.staff_id, s.full_name, s.department, s.latitude, s.longitude,
+               COALESCE(t.active_tasks, 0) AS active_tasks
+        FROM staff_basic_info s
+        LEFT JOIN (
+            SELECT assigned_staff_id, COUNT(*) AS active_tasks
+            FROM maintenance_tasks
+            WHERE status NOT IN ('已完成', '已取消')
+            GROUP BY assigned_staff_id
+        ) t ON s.staff_id = t.assigned_staff_id
+        WHERE s.is_active = 1
+    """)
+    rows = cursor.fetchall()
+    if not rows:
+        return None, None, None, None
+
+    max_tasks = max(r["active_tasks"] for r in rows) or 1
+    # 收集有坐标的员工距离，用于归一化
+    dists = []
+    for r in rows:
+        if task_lat and task_lng and r["latitude"] and r["longitude"]:
+            dists.append(_haversine_km(float(task_lat), float(task_lng), float(r["latitude"]), float(r["longitude"])))
+        else:
+            dists.append(None)
+    valid_dists = [d for d in dists if d is not None]
+    max_dist = max(valid_dists) if valid_dists else 1
+
+    best, best_score, best_dist = None, float("inf"), None
+    for i, r in enumerate(rows):
+        dept_score = 0.0 if (target_dept and r["department"] == target_dept) else 1.0
+        dist_km = dists[i]
+        dist_score = (dist_km / max_dist) if dist_km is not None else 0.5
+        task_score = r["active_tasks"] / max_tasks
+        score = dept_score * 0.4 + dist_score * 0.3 + task_score * 0.3
+        if score < best_score:
+            best_score = score
+            best = r
+            best_dist = dist_km
+
+    if not best:
+        return None, None, None, None
+    return best["staff_id"], best["full_name"], best_dist, best["active_tasks"]
 
 
 def task_upload_base_dir():
@@ -1583,6 +1649,49 @@ def api_task_image_delete(task_id, image_id):
             connection.close()
 
 
+@app.route("/api/staff/location", methods=["POST"])
+def api_staff_location():
+    """员工更新自己的实时GPS坐标"""
+    if not is_logged_in():
+        return jsonify({"ok": False, "message": "请先登录"}), 401
+    user = get_current_user()
+    if not user:
+        return jsonify({"ok": False, "message": "请先登录"}), 401
+    data = request.get_json(silent=True) or {}
+    try:
+        lat = float(data.get("lat"))
+        lng = float(data.get("lng"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "message": "坐标格式错误"}), 400
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+        return jsonify({"ok": False, "message": "坐标超出范围"}), 400
+    # 管理员/班长可传入任意 staff_id，否则只能更新自己绑定的
+    requested_staff_id = data.get("staff_id")
+    if requested_staff_id and user.get("role_level", 1) >= 2:
+        target_staff_id = int(requested_staff_id)
+    elif user.get("staff_id"):
+        target_staff_id = int(user["staff_id"])
+    else:
+        return jsonify({"ok": False, "message": "当前账号未绑定员工，请联系管理员"}), 400
+    connection = get_db_connection()
+    if not connection:
+        return jsonify({"ok": False, "message": "数据库连接失败"}), 500
+    try:
+        cur = connection.cursor()
+        cur.execute(
+            "UPDATE staff_basic_info SET latitude=%s, longitude=%s, location_updated_at=NOW() WHERE staff_id=%s",
+            (lat, lng, target_staff_id),
+        )
+        connection.commit()
+        cur.close()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "message": str(e)}), 500
+    finally:
+        if connection and getattr(connection, "open", False):
+            connection.close()
+
+
 @app.route("/account_management")
 @require_role_level(3)
 def account_management():
@@ -1973,7 +2082,7 @@ def task_statistics_export():
 
 
 def ensure_staff_columns(connection):
-    """幂等地为 staff_basic_info 补充 department 和 team_name 列"""
+    """幂等地为 staff_basic_info 补充扩展列"""
     cur = connection.cursor()
     cur.execute("SHOW COLUMNS FROM staff_basic_info LIKE 'department'")
     if not cur.fetchone():
@@ -1981,6 +2090,18 @@ def ensure_staff_columns(connection):
     cur.execute("SHOW COLUMNS FROM staff_basic_info LIKE 'team_name'")
     if not cur.fetchone():
         cur.execute("ALTER TABLE staff_basic_info ADD COLUMN team_name VARCHAR(50) NULL AFTER team_id")
+    cur.execute("SHOW COLUMNS FROM staff_basic_info LIKE 'home_address'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE staff_basic_info ADD COLUMN home_address VARCHAR(200) NULL AFTER department")
+    cur.execute("SHOW COLUMNS FROM staff_basic_info LIKE 'latitude'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE staff_basic_info ADD COLUMN latitude DECIMAL(10,7) NULL AFTER home_address")
+    cur.execute("SHOW COLUMNS FROM staff_basic_info LIKE 'longitude'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE staff_basic_info ADD COLUMN longitude DECIMAL(10,7) NULL AFTER latitude")
+    cur.execute("SHOW COLUMNS FROM staff_basic_info LIKE 'location_updated_at'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE staff_basic_info ADD COLUMN location_updated_at DATETIME NULL AFTER longitude")
     connection.commit()
     cur.close()
 
@@ -1988,6 +2109,8 @@ def ensure_staff_columns(connection):
 @app.route('/staff')
 def staff_page():
     """员工管理（独立页面）"""
+    if not is_logged_in():
+        return redirect(url_for('login'))
     connection = get_db_connection()
     if not connection:
         flash('数据库连接失败', 'danger')
@@ -1996,11 +2119,20 @@ def staff_page():
     try:
         ensure_staff_columns(connection)
         cursor = connection.cursor()
-        view_mode = request.args.get('view', '')
-        if view_mode == 'all':
-            cursor.execute("SELECT * FROM staff_basic_info ORDER BY staff_id")
+        user = get_current_user()
+        # 普通员工只能看自己
+        if user and user.get('role_level', 1) < 2:
+            my_staff_id = user.get('staff_id')
+            if my_staff_id:
+                cursor.execute("SELECT * FROM staff_basic_info WHERE staff_id = %s", (my_staff_id,))
+            else:
+                cursor.execute("SELECT * FROM staff_basic_info WHERE 1=0")
         else:
-            cursor.execute("SELECT * FROM staff_basic_info ORDER BY staff_id LIMIT 100")
+            view_mode = request.args.get('view', '')
+            if view_mode == 'all':
+                cursor.execute("SELECT * FROM staff_basic_info ORDER BY staff_id")
+            else:
+                cursor.execute("SELECT * FROM staff_basic_info ORDER BY staff_id LIMIT 100")
 
         staff_list = cursor.fetchall()
         cursor.close()
@@ -2076,17 +2208,19 @@ def add_staff():
             education_val = education if education else None
             department_val = department if department else None
             team_name_val = team_name if team_name else None
+            home_address_val = request.form.get('home_address', '').strip() or None
 
             # 插入数据
             cursor.execute('''
             INSERT INTO staff_basic_info
             (full_name, gender, id_card, private_phone, work_phone, emergency_contact, emergency_phone,
-             education, entry_date, departure_date, is_active, region_id, team_id, team_name, position, department)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             education, entry_date, departure_date, is_active, region_id, team_id, team_name, position, department, home_address)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ''', (
                 full_name, gender, id_card, private_phone, work_phone,
                 emergency_contact, emergency_phone, education_val, entry_date,
-                departure_date_val, is_active, region_id_val, team_id_val, team_name_val, position, department_val
+                departure_date_val, is_active, region_id_val, team_id_val, team_name_val, position, department_val,
+                home_address_val
             ))
             
             connection.commit()
@@ -2112,8 +2246,15 @@ def add_staff():
 
 # 编辑员工路由
 @app.route('/edit_staff/<int:staff_id>', methods=['GET', 'POST'])
-@require_role_level(3)
 def edit_staff(staff_id):
+    if not is_logged_in():
+        return redirect(url_for('login'))
+    user = get_current_user()
+    # 普通员工只能编辑自己绑定的记录
+    if user and user.get('role_level', 1) < 2:
+        if not user.get('staff_id') or int(user['staff_id']) != staff_id:
+            flash('无权限编辑其他员工信息', 'danger')
+            return redirect(url_for('staff_page'))
     if request.method == 'POST':
         connection = get_db_connection()
         if not connection:
@@ -2175,6 +2316,7 @@ def edit_staff(staff_id):
             education_val = education if education else None
             department_val = department if department else None
             team_name_val = team_name if team_name else None
+            home_address_val = request.form.get('home_address', '').strip() or None
 
             # 更新数据
             cursor.execute('''
@@ -2183,19 +2325,21 @@ def edit_staff(staff_id):
                 work_phone = %s, emergency_contact = %s, emergency_phone = %s,
                 education = %s, entry_date = %s, departure_date = %s,
                 is_active = %s, region_id = %s, team_id = %s, team_name = %s,
-                position = %s, department = %s,
+                position = %s, department = %s, home_address = %s,
                 updated_at = NOW()
             WHERE staff_id = %s
             ''', (
                 full_name, gender, id_card, private_phone, work_phone,
                 emergency_contact, emergency_phone, education_val, entry_date,
                 departure_date_val, is_active, region_id_val, team_id_val, team_name_val,
-                position, department_val, staff_id
+                position, department_val, home_address_val, staff_id
             ))
             
             connection.commit()
             flash('员工信息更新成功', 'success')
-            return redirect(url_for('staff_page'))
+            if user and user.get('role_level', 1) >= 2:
+                return redirect(url_for('staff_page'))
+            return redirect(url_for('my_profile'))
             
         except Exception as e:
             if connection:
@@ -2239,6 +2383,59 @@ def edit_staff(staff_id):
                 pass
         if connection and getattr(connection, 'open', False):
             connection.close()
+
+@app.route('/staff/<int:staff_id>/view')
+def view_staff(staff_id):
+    if not is_logged_in():
+        return redirect(url_for('login'))
+    connection = get_db_connection()
+    if not connection:
+        flash('数据库连接失败', 'danger')
+        return redirect(url_for('staff_page'))
+    try:
+        ensure_staff_columns(connection)
+        cursor = connection.cursor()
+        cursor.execute("SELECT * FROM staff_basic_info WHERE staff_id = %s", (staff_id,))
+        staff = cursor.fetchone()
+        cursor.close()
+        connection.close()
+        if not staff:
+            flash('未找到该员工信息', 'danger')
+            return redirect(url_for('staff_page'))
+        return render_template_string(MY_PROFILE_HTML, staff=staff)
+    except Exception as e:
+        flash(f'获取员工信息失败: {str(e)}', 'danger')
+        return redirect(url_for('staff_page'))
+
+
+@app.route('/my_profile')
+def my_profile():
+    if not is_logged_in():
+        return redirect(url_for('login'))
+    user = get_current_user()
+    staff_id = user.get('staff_id') if user else None
+    if not staff_id:
+        flash('当前账号未绑定员工信息，请联系管理员', 'warning')
+        return redirect(url_for('tasks_page'))
+    connection = get_db_connection()
+    if not connection:
+        flash('数据库连接失败', 'danger')
+        return redirect(url_for('tasks_page'))
+    try:
+        ensure_staff_columns(connection)
+        cursor = connection.cursor()
+        cursor.execute("SELECT * FROM staff_basic_info WHERE staff_id = %s", (staff_id,))
+        staff = cursor.fetchone()
+        cursor.close()
+        connection.close()
+        if not staff:
+            flash('未找到员工信息，请联系管理员', 'warning')
+            return redirect(url_for('tasks_page'))
+        return render_template_string(MY_PROFILE_HTML, staff=staff)
+    except Exception as e:
+        flash(f'获取员工信息失败: {str(e)}', 'danger')
+        return redirect(url_for('tasks_page'))
+
 
 # 删除员工路由
 @app.route('/delete_staff/<int:staff_id>', methods=['POST'])
@@ -2380,6 +2577,13 @@ def add_task():
             fault_phenomenon = request.form.get("fault_phenomenon", "").strip()
             resolution_method = request.form.get("resolution_method", "").strip()
             customer_address = request.form.get("customer_address", "").strip()
+            task_lat_raw = request.form.get("task_lat", "").strip()
+            task_lng_raw = request.form.get("task_lng", "").strip()
+            try:
+                task_lat = float(task_lat_raw) if task_lat_raw else None
+                task_lng = float(task_lng_raw) if task_lng_raw else None
+            except ValueError:
+                task_lat = task_lng = None
 
             if not title:
                 flash("请填写任务标题", "danger")
@@ -2406,8 +2610,21 @@ def add_task():
                  fault_phenomenon or None, resolution_method or None, priority, due_date),
             )
             new_id = cursor.lastrowid
+
+            # 智能自动派单
+            auto_staff_id, auto_name, auto_dist, auto_tasks = _auto_assign_staff(cursor, fault_type, task_lat, task_lng)
+            if auto_staff_id:
+                cursor.execute(
+                    """UPDATE maintenance_tasks SET assigned_staff_id=%s, assigned_at=NOW(), status='已派单', updated_at=NOW()
+                       WHERE task_id=%s""",
+                    (auto_staff_id, new_id),
+                )
+                dist_str = f"，距离约 {auto_dist:.1f} km" if auto_dist is not None else ""
+                flash(f"任务已添加，已自动派单给 {auto_name}（当前 {auto_tasks} 个任务{dist_str}）", "success")
+            else:
+                flash("任务已添加，暂无合适员工，请手动派单", "warning")
+
             connection.commit()
-            flash("任务已添加，可在工单详情页上传现场照片", "success")
             return redirect(url_for("task_detail", task_id=new_id))
         except Exception as e:
             if connection:
@@ -2954,8 +3171,6 @@ TASK_STATISTICS_HTML = '''
             <a href="{{ url_for('task_statistics') }}" class="active">数据统计</a>
             <a href="{{ url_for('account_management') }}">账号管理</a>
         </nav>
-
-        {% with messages = get_flashed_messages(with_categories=true) %}
           {% if messages %}
             <div class="flash-messages">
               {% for category, message in messages %}
@@ -3246,7 +3461,11 @@ TASKS_PAGE_HTML = '''
 
         <nav class="module-nav" aria-label="模块切换">
             <a href="{{ url_for('tasks_page') }}" class="active">任务管理</a>
+            {% if current_user and current_user.role_level >= 2 %}
             <a href="{{ url_for('staff_page') }}">员工管理</a>
+            {% else %}
+            <a href="{{ url_for('my_profile') }}">个人信息</a>
+            {% endif %}
             {% if current_user and current_user.role_level >= 3 %}
             <a href="{{ url_for('task_statistics') }}">数据统计</a>
             <a href="{{ url_for('account_management') }}">账号管理</a>
@@ -3512,7 +3731,11 @@ STAFF_PAGE_HTML = '''
 
         <nav class="module-nav" aria-label="模块切换">
             <a href="{{ url_for('tasks_page') }}">任务管理</a>
+            {% if current_user and current_user.role_level >= 2 %}
             <a href="{{ url_for('staff_page') }}" class="active">员工管理</a>
+            {% else %}
+            <a href="{{ url_for('my_profile') }}" class="active">个人信息</a>
+            {% endif %}
             {% if current_user and current_user.role_level >= 3 %}
             <a href="{{ url_for('task_statistics') }}">数据统计</a>
             <a href="{{ url_for('account_management') }}">账号管理</a>
@@ -3547,6 +3770,8 @@ STAFF_PAGE_HTML = '''
                     <th>岗位</th>
                     <th>所属部门</th>
                     <th>所属班组</th>
+                    <th>常驻地址</th>
+                    <th>位置</th>
                     <th>入职日期</th>
                     <th>在职状态</th>
                     <th>操作</th>
@@ -3558,12 +3783,16 @@ STAFF_PAGE_HTML = '''
                     <td>{{ staff.position }}</td>
                     <td>{{ staff.department or '—' }}</td>
                     <td>{{ staff.team_name or (('班组 ' ~ staff.team_id) if staff.team_id else '—') }}</td>
+                    <td>{{ staff.home_address or '—' }}</td>
+                    <td>{% if staff.latitude and staff.longitude %}📍{% if staff.location_updated_at %}<br><small style="color:#9ca3af;">{{ staff.location_updated_at }}</small>{% endif %}{% else %}—{% endif %}</td>
                     <td>{{ staff.entry_date }}</td>
                     <td>{{ '在职' if staff.is_active else '离职' }}</td>
                     <td class="action-buttons">
-                        <a href="#" class="btn btn-primary">查看</a>
-                        {% if current_user and current_user.role_level >= 3 %}
+                        <a href="{{ url_for('view_staff', staff_id=staff.staff_id) }}" class="btn btn-primary">查看</a>
+                        {% if current_user and (current_user.role_level >= 3 or current_user.staff_id == staff.staff_id) %}
                         <a href="{{ url_for('edit_staff', staff_id=staff.staff_id) }}" class="btn btn-warning">编辑</a>
+                        {% endif %}
+                        {% if current_user and current_user.role_level >= 3 %}
                         <form class="delete-form" action="{{ url_for('delete_staff', staff_id=staff.staff_id) }}" method="post" onsubmit="return confirm('确定要删除该员工信息吗？');">
                             <button type="submit" class="btn btn-danger">删除</button>
                         </form>
@@ -3585,11 +3814,15 @@ STAFF_PAGE_HTML = '''
                     <div class="staff-card-meta">
                         {% if staff.department %}部门：{{ staff.department }}<br>{% endif %}
                         班组：{{ staff.team_name or (('班组 ' ~ staff.team_id) if staff.team_id else '未分配') }}<br>
+                        {% if staff.home_address %}地址：{{ staff.home_address }}<br>{% endif %}
+                        {% if staff.latitude and staff.longitude %}📍 已记录GPS{% if staff.location_updated_at %}（{{ staff.location_updated_at }}）{% endif %}<br>{% endif %}
                         入职：{{ staff.entry_date }} · {{ '在职' if staff.is_active else '离职' }}
                     </div>
                     <div class="staff-card-actions">
-                        {% if current_user and current_user.role_level >= 3 %}
+                        {% if current_user and (current_user.role_level >= 3 or current_user.staff_id == staff.staff_id) %}
                         <a href="{{ url_for('edit_staff', staff_id=staff.staff_id) }}" class="btn btn-warning">编辑</a>
+                        {% endif %}
+                        {% if current_user and current_user.role_level >= 3 %}
                         <form class="delete-form" action="{{ url_for('delete_staff', staff_id=staff.staff_id) }}" method="post" onsubmit="return confirm('确定要删除该员工信息吗？');">
                             <button type="submit" class="btn btn-danger">删除</button>
                         </form>
@@ -3983,10 +4216,11 @@ ADD_STAFF_HTML = '''
                     <input type="text" id="team_name" name="team_name" maxlength="50" placeholder="如：一班、光纤组">
                 </div>
                 <div class="form-group">
+                    <label for="home_address">常驻地址</label>
+                    <input type="text" id="home_address" name="home_address" maxlength="200" placeholder="如：XX市XX区XX路XX号">
+                </div>
+                <div class="form-group">
                     <label for="position">岗位 <span class="required-mark">*</span></label>
-                    <select id="position" name="position" required>
-                        <option value="">请选择</option>
-                        <option value="装维工程师">装维工程师</option>
                         <option value="班组长">班组长</option>
                         <option value="区域主管">区域主管</option>
                         <option value="HR专员">HR专员</option>
@@ -3999,6 +4233,71 @@ ADD_STAFF_HTML = '''
                     <a href="{{ url_for('staff_page') }}" class="btn btn-danger">取消</a>
                 </div>
             </form>
+        </div>
+    </div>
+</body>
+</html>
+'''
+
+MY_PROFILE_HTML = '''
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>个人信息 - 装维部门</title>
+    <style>
+        body { font-family: "Microsoft YaHei", sans-serif; margin: 0; padding: 20px; background-color: #f5f5f5; }
+        .container { max-width: 700px; margin: 0 auto; }
+        header { background-color: #2c3e50; color: white; padding: 15px 20px; border-radius: 5px; margin-bottom: 16px; }
+        header h1 { margin: 0; font-size: 1.35rem; }
+        .module-nav { display: flex; gap: 4px; margin-bottom: 20px; background: white; border-radius: 5px; padding: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.06); width: fit-content; }
+        .module-nav a { padding: 10px 22px; text-decoration: none; color: #555; border-radius: 4px; font-weight: 500; font-size: 14px; }
+        .module-nav a.active { background: #3498db; color: white; }
+        .module-nav a:not(.active):hover { background: #ecf0f1; color: #2c3e50; }
+        .card { background: white; border-radius: 5px; padding: 24px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .card h2 { margin: 0 0 20px 0; font-size: 1.1rem; color: #2c3e50; }
+        .info-row { display: flex; padding: 10px 0; border-bottom: 1px solid #f0f0f0; font-size: 14px; }
+        .info-row:last-child { border-bottom: none; }
+        .info-label { width: 110px; color: #6b7280; flex-shrink: 0; }
+        .info-value { color: #1f2937; flex: 1; }
+        .btn { display: inline-block; padding: 9px 20px; background: #3498db; color: white; border: none; border-radius: 4px; cursor: pointer; text-decoration: none; font-size: 14px; margin-top: 20px; }
+        .btn-warning { background: #f39c12; }
+        .flash-messages { margin-bottom: 16px; }
+        .alert-success { background: #dff0d8; color: #3c763d; border: 1px solid #d6e9c6; padding: 10px; border-radius: 4px; }
+        .alert-warning { background: #fcf8e3; color: #8a6d3b; border: 1px solid #faebcc; padding: 10px; border-radius: 4px; }
+        .alert-danger { background: #f2dede; color: #a94442; border: 1px solid #ebccd1; padding: 10px; border-radius: 4px; }
+        @media (max-width: 700px) { body { padding: 10px; } .module-nav { width: 100%; overflow-x: auto; } .module-nav a { padding: 8px 14px; font-size: 13px; white-space: nowrap; } }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header><h1>装维部门管理系统</h1></header>
+        <nav class="module-nav" aria-label="模块切换">
+            <a href="{{ url_for('tasks_page') }}">任务管理</a>
+            <a href="{{ url_for('my_profile') }}" class="active">个人信息</a>
+        </nav>
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}<div class="flash-messages">{% for category, message in messages %}<div class="alert-{{ category }}">{{ message }}</div>{% endfor %}</div>{% endif %}
+        {% endwith %}
+        <div class="card">
+            <h2>我的信息</h2>
+            <div class="info-row"><span class="info-label">姓名</span><span class="info-value">{{ staff.full_name }}</span></div>
+            <div class="info-row"><span class="info-label">性别</span><span class="info-value">{{ staff.gender or '—' }}</span></div>
+            <div class="info-row"><span class="info-label">岗位</span><span class="info-value">{{ staff.position or '—' }}</span></div>
+            <div class="info-row"><span class="info-label">所属部门</span><span class="info-value">{{ staff.department or '—' }}</span></div>
+            <div class="info-row"><span class="info-label">所属班组</span><span class="info-value">{{ staff.team_name or '—' }}</span></div>
+            <div class="info-row"><span class="info-label">工作电话</span><span class="info-value">{{ staff.work_phone or '—' }}</span></div>
+            <div class="info-row"><span class="info-label">常驻地址</span><span class="info-value">{{ staff.home_address or '—' }}</span></div>
+            <div class="info-row"><span class="info-label">入职日期</span><span class="info-value">{{ staff.entry_date or '—' }}</span></div>
+            <div class="info-row"><span class="info-label">在职状态</span><span class="info-value">{{ '在职' if staff.is_active else '离职' }}</span></div>
+            <div class="info-row"><span class="info-label">GPS位置</span><span class="info-value">{% if staff.latitude and staff.longitude %}📍 已记录{% if staff.location_updated_at %}（{{ staff.location_updated_at }}）{% endif %}{% else %}未记录{% endif %}</span></div>
+            {% if current_user and (current_user.role_level >= 3 or current_user.staff_id == staff.staff_id) %}
+            <a href="{{ url_for('edit_staff', staff_id=staff.staff_id) }}" class="btn btn-warning">编辑信息</a>
+            {% endif %}
+            {% if current_user and current_user.role_level >= 2 %}
+            <a href="{{ url_for('staff_page') }}" class="btn" style="background:#6b7280;">返回员工列表</a>
+            {% endif %}
         </div>
     </div>
 </body>
@@ -4113,6 +4412,17 @@ EDIT_STAFF_HTML = '''
             </div>
         </header>
 
+        {% if current_user and current_user.role_level >= 2 %}
+        <nav class="module-nav" aria-label="模块切换">
+            <a href="{{ url_for('tasks_page') }}">任务管理</a>
+            <a href="{{ url_for('staff_page') }}" class="active">员工管理</a>
+            {% if current_user.role_level >= 3 %}
+            <a href="{{ url_for('task_statistics') }}">数据统计</a>
+            <a href="{{ url_for('account_management') }}">账号管理</a>
+            {% endif %}
+        </nav>
+        {% endif %}
+
         <!-- 消息提示区域 -->
         {% with messages = get_flashed_messages(with_categories=true) %}
           {% if messages %}
@@ -4127,10 +4437,6 @@ EDIT_STAFF_HTML = '''
         <div class="card">
             <h2>编辑员工信息</h2>
             <form method="post">
-                <div class="form-group">
-                    <label for="full_name">姓名 <span class="required-mark">*</span></label>
-                    <input type="text" id="full_name" name="full_name" value="{{ staff.full_name }}" required>
-                </div>
                 <div class="form-group">
                     <label for="gender">性别 <span class="required-mark">*</span></label>
                     <select id="gender" name="gender" required>
@@ -4179,10 +4485,6 @@ EDIT_STAFF_HTML = '''
                     <input type="date" id="departure_date" name="departure_date" value="{{ staff.departure_date or '' }}">
                 </div>
                 <div class="form-group">
-                    <label for="region_id">区域ID</label>
-                    <input type="number" id="region_id" name="region_id" value="{{ staff.region_id or '' }}" min="1">
-                </div>
-                <div class="form-group">
                     <label for="department">所属部门</label>
                     <input type="text" id="department" name="department" value="{{ staff.department or '' }}" maxlength="50" placeholder="如：装维一部、客服部">
                 </div>
@@ -4193,6 +4495,23 @@ EDIT_STAFF_HTML = '''
                 <div class="form-group">
                     <label for="team_name">班组名称</label>
                     <input type="text" id="team_name" name="team_name" value="{{ staff.team_name or '' }}" maxlength="50" placeholder="如：一班、光纤组">
+                </div>
+                <div class="form-group">
+                    <label for="home_address">常驻地址</label>
+                    <input type="text" id="home_address" name="home_address" value="{{ staff.home_address or '' }}" maxlength="200" placeholder="如：XX市XX区XX路XX号">
+                </div>
+                <div class="form-group">
+                    <label>实时位置</label>
+                    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                        <button type="button" class="btn btn-primary" onclick="updateGPS()" id="gps-btn">📍 更新当前位置</button>
+                        <span id="gps-status" style="font-size:13px;color:#6b7280;">
+                            {% if staff.latitude and staff.longitude %}
+                            已记录坐标（{{ "%.4f"|format(staff.latitude) }}, {{ "%.4f"|format(staff.longitude) }}）{% if staff.location_updated_at %}，更新于 {{ staff.location_updated_at }}{% endif %}
+                            {% else %}
+                            暂无GPS坐标
+                            {% endif %}
+                        </span>
+                    </div>
                 </div>
                 <div class="form-group">
                     <label for="position">岗位 <span class="required-mark">*</span></label>
@@ -4207,11 +4526,45 @@ EDIT_STAFF_HTML = '''
                 </div>
                 <div class="form-actions">
                     <button type="submit" class="btn btn-success">保存</button>
-                    <a href="{{ url_for('staff_page') }}" class="btn btn-danger">取消</a>
+                    <a href="{{ url_for('staff_page') if current_user and current_user.role_level >= 2 else url_for('my_profile') }}" class="btn btn-danger">取消</a>
                 </div>
             </form>
         </div>
     </div>
+<script>
+function updateGPS() {
+    var btn = document.getElementById('gps-btn');
+    var status = document.getElementById('gps-status');
+    if (!navigator.geolocation) {
+        status.textContent = '浏览器不支持定位';
+        return;
+    }
+    btn.disabled = true;
+    btn.textContent = '定位中...';
+    navigator.geolocation.getCurrentPosition(function(pos) {
+        fetch('/api/staff/location', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({lat: pos.coords.latitude, lng: pos.coords.longitude, staff_id: {{ staff.staff_id }}})
+        }).then(function(r){ return r.json(); }).then(function(d) {
+            if (d.ok) {
+                status.textContent = '位置已更新（' + pos.coords.latitude.toFixed(4) + ', ' + pos.coords.longitude.toFixed(4) + '）';
+                status.style.color = '#15803d';
+            } else {
+                status.textContent = '更新失败：' + d.message;
+                status.style.color = '#b91c1c';
+            }
+            btn.disabled = false;
+            btn.textContent = '📍 更新当前位置';
+        });
+    }, function(err) {
+        status.textContent = '定位失败：' + err.message;
+        status.style.color = '#b91c1c';
+        btn.disabled = false;
+        btn.textContent = '📍 更新当前位置';
+    });
+}
+</script>
 </body>
 </html>
 '''
@@ -4514,7 +4867,13 @@ ADD_TASK_HTML = '''
                 </script>
                 <div class="form-group">
                     <label for="customer_address">客户地址</label>
-                    <input type="text" id="customer_address" name="customer_address" maxlength="500" placeholder="客户详细地址">
+                    <div style="display:flex;gap:8px;align-items:center;">
+                        <input type="text" id="customer_address" name="customer_address" maxlength="500" placeholder="客户详细地址" style="flex:1;">
+                        <button type="button" class="btn btn-primary" style="white-space:nowrap;" onclick="getTaskLocation()">📍 获取位置</button>
+                    </div>
+                    <input type="hidden" id="task_lat" name="task_lat">
+                    <input type="hidden" id="task_lng" name="task_lng">
+                    <small id="loc-status" style="color:#6b7280;font-size:12px;"></small>
                 </div>
                 <div class="form-group">
                     <label for="description">任务说明</label>
@@ -4539,6 +4898,22 @@ ADD_TASK_HTML = '''
             </form>
         </div>
     </div>
+<script>
+function getTaskLocation() {
+    var status = document.getElementById('loc-status');
+    if (!navigator.geolocation) { status.textContent = '浏览器不支持定位'; return; }
+    status.textContent = '定位中...';
+    navigator.geolocation.getCurrentPosition(function(pos) {
+        document.getElementById('task_lat').value = pos.coords.latitude;
+        document.getElementById('task_lng').value = pos.coords.longitude;
+        status.textContent = '已获取位置（' + pos.coords.latitude.toFixed(4) + ', ' + pos.coords.longitude.toFixed(4) + '）';
+        status.style.color = '#15803d';
+    }, function(err) {
+        status.textContent = '定位失败：' + err.message;
+        status.style.color = '#b91c1c';
+    });
+}
+</script>
 </body>
 </html>
 '''
