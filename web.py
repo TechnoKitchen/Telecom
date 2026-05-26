@@ -1649,22 +1649,51 @@ def api_task_image_delete(task_id, image_id):
             connection.close()
 
 
+@app.route("/api/ip_location")
+def api_ip_location():
+    """通过客户端IP查询省市（ip-api.com，无需Key）"""
+    if not is_logged_in():
+        return jsonify({"ok": False, "message": "请先登录"}), 401
+    import urllib.request as _urlreq
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr) or ""
+    if "," in client_ip:
+        client_ip = client_ip.split(",")[0].strip()
+    # 本地/内网IP回退到空串让ip-api自动检测
+    if client_ip in ("127.0.0.1", "::1") or client_ip.startswith("192.168.") or client_ip.startswith("10."):
+        client_ip = ""
+    try:
+        url = f"http://ip-api.com/json/{client_ip}?lang=zh-CN&fields=status,regionName,city"
+        req = _urlreq.Request(url, headers={"User-Agent": "TelecomMaintenance/1.0"})
+        with _urlreq.urlopen(req, timeout=4) as resp:
+            result = json.loads(resp.read().decode())
+        if result.get("status") == "success":
+            province = result.get("regionName", "")
+            province = province.replace("省", "").replace("自治区", "").replace("特别行政区", "").replace("壮族", "").replace("回族", "").replace("维吾尔", "")
+            city = result.get("city", "").replace("市", "")
+            return jsonify({"ok": True, "province": province, "city": city})
+        return jsonify({"ok": False, "message": "IP定位返回失败"})
+    except Exception as e:
+        return jsonify({"ok": False, "message": str(e)})
+
+
 @app.route("/api/staff/location", methods=["POST"])
 def api_staff_location():
-    """员工更新自己的实时GPS坐标"""
+    """员工更新实时位置（GPS坐标和/或省市）"""
     if not is_logged_in():
         return jsonify({"ok": False, "message": "请先登录"}), 401
     user = get_current_user()
     if not user:
         return jsonify({"ok": False, "message": "请先登录"}), 401
     data = request.get_json(silent=True) or {}
-    try:
-        lat = float(data.get("lat"))
-        lng = float(data.get("lng"))
-    except (TypeError, ValueError):
-        return jsonify({"ok": False, "message": "坐标格式错误"}), 400
-    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
-        return jsonify({"ok": False, "message": "坐标超出范围"}), 400
+    lat = lng = None
+    if data.get("lat") is not None and data.get("lng") is not None:
+        try:
+            lat = float(data["lat"])
+            lng = float(data["lng"])
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "message": "坐标格式错误"}), 400
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+            return jsonify({"ok": False, "message": "坐标超出范围"}), 400
     # 管理员/班长可传入任意 staff_id，否则只能更新自己绑定的
     requested_staff_id = data.get("staff_id")
     if requested_staff_id and user.get("role_level", 1) >= 2:
@@ -1680,19 +1709,22 @@ def api_staff_location():
         cur = connection.cursor()
         province = data.get("province", "").strip() or None
         city = data.get("city", "").strip() or None
-        if province or city:
-            cur.execute(
-                """UPDATE staff_basic_info
-                   SET latitude=%s, longitude=%s, location_updated_at=NOW(),
-                       location_province=%s, location_city=%s
-                   WHERE staff_id=%s""",
-                (lat, lng, province, city, target_staff_id),
-            )
-        else:
-            cur.execute(
-                "UPDATE staff_basic_info SET latitude=%s, longitude=%s, location_updated_at=NOW() WHERE staff_id=%s",
-                (lat, lng, target_staff_id),
-            )
+        set_parts = ["location_updated_at=NOW()"]
+        params = []
+        if lat is not None:
+            set_parts += ["latitude=%s", "longitude=%s"]
+            params += [lat, lng]
+        if province is not None:
+            set_parts.append("location_province=%s")
+            params.append(province)
+        if city is not None:
+            set_parts.append("location_city=%s")
+            params.append(city)
+        params.append(target_staff_id)
+        cur.execute(
+            f"UPDATE staff_basic_info SET {', '.join(set_parts)} WHERE staff_id=%s",
+            params,
+        )
         connection.commit()
         cur.close()
         return jsonify({"ok": True, "province": province, "city": city})
@@ -4576,63 +4608,41 @@ EDIT_STAFF_HTML = '''
 function autoLocateProvCity() {
     var btn = document.getElementById('gps-btn');
     var status = document.getElementById('gps-status');
-    if (!navigator.geolocation) {
-        status.textContent = '浏览器不支持定位';
-        status.style.color = '#b91c1c';
-        return;
-    }
     btn.disabled = true;
     btn.textContent = '定位中...';
     status.style.color = '#6b7280';
-    status.textContent = '正在获取GPS坐标...';
-    navigator.geolocation.getCurrentPosition(function(pos) {
-        var lat = pos.coords.latitude;
-        var lng = pos.coords.longitude;
-        status.textContent = '正在反查省市...';
-        fetch('https://nominatim.openstreetmap.org/reverse?format=json&lat=' + lat + '&lon=' + lng + '&accept-language=zh-CN', {
-            headers: {'User-Agent': 'TelecomMaintenance/1.0'}
-        }).then(function(r){ return r.json(); }).then(function(geo) {
-            var addr = geo.address || {};
-            var province = addr.state || addr.province || '';
-            var city = addr.city || addr.county || addr.town || addr.village || '';
-            // 去掉"省"/"市"后缀做简化显示
-            province = province.replace(/省$|自治区$|特别行政区$/, '');
-            city = city.replace(/市$/, '');
-            document.getElementById('location_province').value = province;
-            document.getElementById('location_city').value = city;
-            // 同步下拉框显示
-            setSelectValue('loc_province', province);
-            setSelectValue('loc_city', city);
-            return fetch('/api/staff/location', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({lat: lat, lng: lng, staff_id: {{ staff.staff_id }}, province: province, city: city})
-            });
-        }).then(function(r){ return r.json(); }).then(function(d) {
-            var prov = document.getElementById('location_province').value;
-            var city = document.getElementById('location_city').value;
-            if (d.ok) {
-                status.textContent = '已定位：' + (prov || '') + (city || '') + '（点击保存生效）';
-                status.style.color = '#15803d';
-            } else {
-                status.textContent = '保存失败：' + d.message;
-                status.style.color = '#b91c1c';
-            }
-            btn.disabled = false;
-            btn.textContent = '📍 重新定位';
-        }).catch(function(e) {
-            status.textContent = '反查省市失败，请手动选择';
-            status.style.color = '#b91c1c';
-            btn.disabled = false;
-            btn.textContent = '📍 自动定位省市';
+    status.textContent = '正在通过IP查询省市...';
+    fetch('/api/ip_location').then(function(r){ return r.json(); }).then(function(d) {
+        if (!d.ok) throw new Error(d.message || 'IP定位失败');
+        var province = d.province || '';
+        var city = d.city || '';
+        document.getElementById('location_province').value = province;
+        document.getElementById('location_city').value = city;
+        setSelectValue('loc_province', province);
+        setSelectValue('loc_city', city);
+        return fetch('/api/staff/location', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({staff_id: {{ staff.staff_id }}, province: province, city: city})
         });
-    }, function(err) {
-        var msg = {1:'用户拒绝了定位权限', 2:'无法获取位置信息', 3:'定位超时'}[err.code] || err.message;
-        status.textContent = '定位失败：' + msg;
+    }).then(function(r){ return r.json(); }).then(function(d) {
+        var prov = document.getElementById('location_province').value;
+        var ct = document.getElementById('location_city').value;
+        if (d.ok) {
+            status.textContent = '已定位：' + (prov || '') + (ct ? ' ' + ct : '') + '（点击保存生效）';
+            status.style.color = '#15803d';
+        } else {
+            status.textContent = '保存失败：' + d.message;
+            status.style.color = '#b91c1c';
+        }
+        btn.disabled = false;
+        btn.textContent = '📍 重新定位';
+    }).catch(function(e) {
+        status.textContent = '定位失败：' + e.message;
         status.style.color = '#b91c1c';
         btn.disabled = false;
         btn.textContent = '📍 自动定位省市';
-    }, {timeout: 10000});
+    });
 }
 
 function setSelectValue(id, val) {
