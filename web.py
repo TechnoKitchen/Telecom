@@ -13,6 +13,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 import cloudinary
 import cloudinary.uploader
+from apscheduler.schedulers.background import BackgroundScheduler
 
 cloudinary.config(
     cloud_name=os.environ.get("CLOUDINARY_CLOUD_NAME", "devpzlgvg"),
@@ -261,6 +262,81 @@ def ensure_maintenance_tasks_table(connection):
         cur.execute(
             "ALTER TABLE maintenance_tasks ADD COLUMN resolution_method VARCHAR(50) NULL AFTER fault_phenomenon"
         )
+    cur.execute("SHOW COLUMNS FROM maintenance_tasks LIKE 'returned_by'")
+    if not cur.fetchone():
+        cur.execute(
+            "ALTER TABLE maintenance_tasks ADD COLUMN returned_by INT NULL AFTER resolution_method"
+        )
+    cur.execute("SHOW COLUMNS FROM maintenance_tasks LIKE 'return_count'")
+    if not cur.fetchone():
+        cur.execute(
+            "ALTER TABLE maintenance_tasks ADD COLUMN return_count INT NOT NULL DEFAULT 0 AFTER returned_by"
+        )
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS task_return_log (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            task_id INT NOT NULL,
+            staff_id INT NOT NULL,
+            returned_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_return_staff (staff_id),
+            INDEX idx_return_time (returned_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """)
+    cur.execute("SHOW COLUMNS FROM maintenance_tasks LIKE 'helper_staff_id'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE maintenance_tasks ADD COLUMN helper_staff_id INT NULL AFTER return_count")
+    cur.execute("SHOW COLUMNS FROM maintenance_tasks LIKE 'helper_requested_at'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE maintenance_tasks ADD COLUMN helper_requested_at DATETIME NULL AFTER helper_staff_id")
+    cur.execute("SHOW COLUMNS FROM maintenance_tasks LIKE 'helper_accepted_at'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE maintenance_tasks ADD COLUMN helper_accepted_at DATETIME NULL AFTER helper_requested_at")
+    cur.execute("SHOW COLUMNS FROM maintenance_tasks LIKE 'helper_status'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE maintenance_tasks ADD COLUMN helper_status VARCHAR(20) NULL AFTER helper_accepted_at")
+    cur.execute("SHOW COLUMNS FROM maintenance_tasks LIKE 'helper_admin_note'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE maintenance_tasks ADD COLUMN helper_admin_note TEXT NULL AFTER helper_status")
+    cur.execute("SHOW COLUMNS FROM maintenance_tasks LIKE 'arrived_at'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE maintenance_tasks ADD COLUMN arrived_at DATETIME NULL AFTER helper_status")
+    cur.execute("SHOW COLUMNS FROM maintenance_tasks LIKE 'completed_at'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE maintenance_tasks ADD COLUMN completed_at DATETIME NULL AFTER arrived_at")
+    cur.execute("SHOW COLUMNS FROM maintenance_tasks LIKE 'settled_at'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE maintenance_tasks ADD COLUMN settled_at DATETIME NULL AFTER completed_at")
+    cur.execute("SHOW COLUMNS FROM maintenance_tasks LIKE 'settled_by'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE maintenance_tasks ADD COLUMN settled_by INT NULL AFTER settled_at")
+    cur.execute("SHOW COLUMNS FROM maintenance_tasks LIKE 'source_report_id'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE maintenance_tasks ADD COLUMN source_report_id INT NULL")
+    cur.execute("SHOW COLUMNS FROM maintenance_tasks LIKE 'reporter_user_id'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE maintenance_tasks ADD COLUMN reporter_user_id INT NULL")
+    cur.execute("SHOW COLUMNS FROM maintenance_tasks LIKE 'suspended_at'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE maintenance_tasks ADD COLUMN suspended_at DATETIME NULL")
+    cur.execute("SHOW COLUMNS FROM maintenance_tasks LIKE 'suspended_by'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE maintenance_tasks ADD COLUMN suspended_by INT NULL")
+    cur.execute("SHOW COLUMNS FROM maintenance_tasks LIKE 'suspend_reason'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE maintenance_tasks ADD COLUMN suspend_reason TEXT NULL")
+    cur.execute("SHOW COLUMNS FROM maintenance_tasks LIKE 'overdue_at'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE maintenance_tasks ADD COLUMN overdue_at DATETIME NULL")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS task_suspend_log (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            task_id INT NOT NULL,
+            staff_id INT NOT NULL,
+            suspended_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_suspend_staff (staff_id),
+            INDEX idx_suspend_time (suspended_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """)
     connection.commit()
     cur.close()
 
@@ -274,12 +350,34 @@ def ensure_task_images_table(connection):
         task_id INT NOT NULL,
         file_path VARCHAR(500) NOT NULL COMMENT 'relative to task_uploads',
         original_filename VARCHAR(255) NULL,
+        image_type VARCHAR(20) NOT NULL DEFAULT 'general',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         INDEX idx_task_images_task (task_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """
     cur = connection.cursor()
     cur.execute(ddl)
+    cur.execute("SHOW COLUMNS FROM task_images LIKE 'image_type'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE task_images ADD COLUMN image_type VARCHAR(20) NOT NULL DEFAULT 'general' AFTER original_filename")
+    connection.commit()
+    cur.close()
+
+
+def ensure_task_settlements_table(connection):
+    """工单结算记录表"""
+    cur = connection.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS task_settlements (
+        settlement_id INT AUTO_INCREMENT PRIMARY KEY,
+        task_id INT NOT NULL,
+        staff_id INT NOT NULL,
+        settled_by INT NOT NULL,
+        settled_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        notes TEXT NULL,
+        INDEX idx_settlements_task (task_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """)
     connection.commit()
     cur.close()
 
@@ -315,7 +413,7 @@ def migrate_legacy_task_photos(connection):
 
 
 TASK_PRIORITIES = ("低", "中", "高")
-TASK_STATUSES = ("待派单", "已派单", "处理中", "待回执", "已完成", "已取消")
+TASK_STATUSES = ("待派单", "已派单", "处理中", "待回执", "已完成", "已取消", "已归档", "已挂起")
 FAULT_BUSINESS_TYPES = ("宽带新装", "宽带修障", "宽带移机", "宽带提速", "IPTV新装", "IPTV修障", "电话新装", "电话修障", "智能组网", "设备更换", "线路维护")
 FAULT_PHENOMENA = ("光衰过大", "ONU离线", "网速不达标", "IPTV卡顿", "WiFi覆盖差", "电话无声", "线路中断", "其他")
 RESOLUTION_METHODS = ("更换光猫", "重新熔纤", "更换尾纤", "重置OLT端口", "更换分光器", "更换网线", "路由器配置", "上门测速", "其他")
@@ -341,14 +439,153 @@ def _haversine_km(lat1, lng1, lat2, lng2):
     return R * 2 * math.asin(math.sqrt(a))
 
 
-def _auto_assign_staff(cursor, fault_type, task_lat, task_lng):
+def _address_matches(address, province, city):
+    """判断地址是否包含指定省市（去后缀后做包含匹配）"""
+    if not address or not province:
+        return False, False
+    addr = address.replace("省","").replace("自治区","").replace("特别行政区","").replace("市","").replace("区","")
+    prov_match = province in addr
+    city_match = bool(city) and city in addr
+    return prov_match, city_match
+
+
+def _get_return_rate(cursor, staff_id):
+    """返回 (return_cnt, assigned_cnt, rate) 最近30天"""
+    cursor.execute(
+        "SELECT COUNT(*) AS cnt FROM task_return_log WHERE staff_id=%s AND returned_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)",
+        (staff_id,),
+    )
+    return_cnt = int((cursor.fetchone() or {}).get("cnt") or 0)
+    cursor.execute(
+        "SELECT COUNT(*) AS cnt FROM maintenance_tasks WHERE assigned_staff_id=%s AND assigned_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)",
+        (staff_id,),
+    )
+    assigned_cnt = int((cursor.fetchone() or {}).get("cnt") or 0)
+    rate = return_cnt / assigned_cnt if assigned_cnt > 0 else 0.0
+    return return_cnt, assigned_cnt, rate
+
+
+def _get_suspend_rate(cursor, staff_id):
+    """返回 (suspend_cnt, assigned_cnt, rate) 最近30天"""
+    cursor.execute(
+        "SELECT COUNT(*) AS cnt FROM task_suspend_log WHERE staff_id=%s AND suspended_at >= DATE_SUB(NOW(), INTERVAL 10 SECOND)",
+        (staff_id,),
+    )
+    suspend_cnt = int((cursor.fetchone() or {}).get("cnt") or 0)
+    cursor.execute(
+        "SELECT COUNT(*) AS cnt FROM maintenance_tasks WHERE assigned_staff_id=%s AND assigned_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)",
+        (staff_id,),
+    )
+    assigned_cnt = int((cursor.fetchone() or {}).get("cnt") or 0)
+    rate = suspend_cnt / assigned_cnt if assigned_cnt > 0 else 0.0
+    return suspend_cnt, assigned_cnt, rate
+
+
+def check_overdue_tasks():
+    """定时任务：检查三类超时工单并自动转派，对原执行人记录退回惩罚"""
+    connection = get_db_connection()
+    if not connection:
+        return
+    try:
+        cursor = connection.cursor()
+
+        # 1. 截止日期超时
+        cursor.execute("""
+            SELECT task_id, fault_type, customer_address, assigned_staff_id
+            FROM maintenance_tasks
+            WHERE due_date IS NOT NULL
+              AND due_date < CURDATE()
+              AND status NOT IN ('已完成','已取消','已归档','已挂起')
+              AND overdue_at IS NULL
+        """)
+        overdue_deadline = cursor.fetchall()
+
+        # 2. SLA超时：派单后8小时未到达
+        cursor.execute("""
+            SELECT task_id, fault_type, customer_address, assigned_staff_id
+            FROM maintenance_tasks
+            WHERE assigned_at IS NOT NULL
+              AND arrived_at IS NULL
+              AND TIMESTAMPDIFF(HOUR, assigned_at, NOW()) >= 8
+              AND status IN ('已派单','处理中')
+              AND overdue_at IS NULL
+        """)
+        overdue_sla = cursor.fetchall()
+
+        # 3. 挂起超时：挂起超过24小时
+        cursor.execute("""
+            SELECT task_id, fault_type, customer_address, assigned_staff_id
+            FROM maintenance_tasks
+            WHERE suspended_at IS NOT NULL
+              AND TIMESTAMPDIFF(HOUR, suspended_at, NOW()) >= 24
+              AND status = '已挂起'
+              AND overdue_at IS NULL
+        """)
+        overdue_suspended = cursor.fetchall()
+
+        all_overdue = list(overdue_deadline) + list(overdue_sla) + list(overdue_suspended)
+
+        for task in all_overdue:
+            task_id = task["task_id"]
+            old_staff_id = task.get("assigned_staff_id")
+
+            if old_staff_id:
+                cursor.execute(
+                    "INSERT INTO task_return_log (task_id, staff_id) VALUES (%s, %s)",
+                    (task_id, old_staff_id),
+                )
+                cursor.execute(
+                    "UPDATE maintenance_tasks SET return_count=return_count+1 WHERE task_id=%s",
+                    (task_id,),
+                )
+
+            fault_type = task.get("fault_type") or ""
+            address = task.get("customer_address") or ""
+            new_id, new_name, _, new_tasks = _auto_assign_staff(
+                cursor, fault_type, None, None,
+                task_address=address,
+                exclude_staff_id=old_staff_id,
+            )
+            if new_id:
+                cursor.execute(
+                    """UPDATE maintenance_tasks
+                       SET assigned_staff_id=%s, assigned_at=NOW(), status='已派单',
+                           arrived_at=NULL, suspended_at=NULL, suspended_by=NULL,
+                           suspend_reason=NULL, overdue_at=NOW(), updated_at=NOW()
+                       WHERE task_id=%s""",
+                    (new_id, task_id),
+                )
+            else:
+                cursor.execute(
+                    """UPDATE maintenance_tasks
+                       SET assigned_staff_id=NULL, assigned_at=NULL, status='待派单',
+                           arrived_at=NULL, suspended_at=NULL, suspended_by=NULL,
+                           suspend_reason=NULL, overdue_at=NOW(), updated_at=NOW()
+                       WHERE task_id=%s""",
+                    (task_id,),
+                )
+
+        connection.commit()
+        cursor.close()
+    except Exception:
+        if connection:
+            connection.rollback()
+    finally:
+        if connection and getattr(connection, "open", False):
+            connection.close()
+
+
+def _auto_assign_staff(cursor, fault_type, task_lat, task_lng, task_address="", exclude_staff_id=None):
     """
-    智能派单：综合部门匹配(40%)、距离(30%)、未完成任务数(30%)评分，返回 (staff_id, full_name, dist_km, active_tasks)。
-    无合适员工时返回 (None, None, None, None)。
+    智能派单：综合部门匹配(40%)、省市匹配(30%)、未完成任务数(30%)评分，返回 (staff_id, full_name, dist_km, active_tasks)。
+    无合适员工时返回 (None, None, None, None)。exclude_staff_id 排除指定员工（退回场景）。
     """
     target_dept = FAULT_TYPE_DEPT_MAP.get(fault_type or "", "")
-    cursor.execute("""
-        SELECT s.staff_id, s.full_name, s.department, s.latitude, s.longitude,
+    exclude_clause = "AND s.staff_id != %s" if exclude_staff_id else ""
+    params = (exclude_staff_id,) if exclude_staff_id else ()
+    cursor.execute(f"""
+        SELECT s.staff_id, s.full_name, s.department,
+               s.location_province, s.location_city,
                COALESCE(t.active_tasks, 0) AS active_tasks
         FROM staff_basic_info s
         LEFT JOIN (
@@ -357,38 +594,44 @@ def _auto_assign_staff(cursor, fault_type, task_lat, task_lng):
             WHERE status NOT IN ('已完成', '已取消')
             GROUP BY assigned_staff_id
         ) t ON s.staff_id = t.assigned_staff_id
-        WHERE s.is_active = 1
-    """)
+        WHERE s.is_active = 1 {exclude_clause}
+    """, params)
     rows = cursor.fetchall()
     if not rows:
         return None, None, None, None
 
     max_tasks = max(r["active_tasks"] for r in rows) or 1
-    # 收集有坐标的员工距离，用于归一化
-    dists = []
-    for r in rows:
-        if task_lat and task_lng and r["latitude"] and r["longitude"]:
-            dists.append(_haversine_km(float(task_lat), float(task_lng), float(r["latitude"]), float(r["longitude"])))
-        else:
-            dists.append(None)
-    valid_dists = [d for d in dists if d is not None]
-    max_dist = max(valid_dists) if valid_dists else 1
 
-    best, best_score, best_dist = None, float("inf"), None
-    for i, r in enumerate(rows):
+    best, best_score = None, float("inf")
+    for r in rows:
         dept_score = 0.0 if (target_dept and r["department"] == target_dept) else 1.0
-        dist_km = dists[i]
-        dist_score = (dist_km / max_dist) if dist_km is not None else 0.5
+        # 省市匹配：同省同市=0，同省不同市=0.5，不同省或无位置=1，员工无位置记录=0.8
+        staff_prov = r.get("location_province") or ""
+        staff_city = r.get("location_city") or ""
+        if staff_prov:
+            prov_match, city_match = _address_matches(task_address, staff_prov, staff_city)
+            if prov_match and city_match:
+                loc_score = 0.0
+            elif prov_match:
+                loc_score = 0.5
+            else:
+                loc_score = 1.0
+        else:
+            loc_score = 0.8  # 无位置记录，劣于有位置匹配的员工
         task_score = r["active_tasks"] / max_tasks
-        score = dept_score * 0.4 + dist_score * 0.3 + task_score * 0.3
+        r_cnt, _r_assigned, r_rate = _get_return_rate(cursor, r["staff_id"])
+        sp_cnt, _sp_assigned, sp_rate = _get_suspend_rate(cursor, r["staff_id"])
+        return_penalty = min(r_rate * 2, 1.0)
+        suspend_penalty = min(sp_rate * 2, 1.0)
+        penalty = (return_penalty + suspend_penalty) / 2
+        score = dept_score * 0.32 + loc_score * 0.24 + task_score * 0.24 + penalty * 0.20
         if score < best_score:
             best_score = score
             best = r
-            best_dist = dist_km
 
     if not best:
         return None, None, None, None
-    return best["staff_id"], best["full_name"], best_dist, best["active_tasks"]
+    return best["staff_id"], best["full_name"], None, best["active_tasks"]
 
 
 def task_upload_base_dir():
@@ -460,7 +703,6 @@ def images_to_json_list(rows):
     out = []
     for r in rows or []:
         fp = r.get("file_path") or ""
-        # fp 存的是 Cloudinary public_id，生成安全 CDN URL
         try:
             url = cloudinary.utils.cloudinary_url(fp, secure=True)[0]
         except Exception:
@@ -472,6 +714,7 @@ def images_to_json_list(rows):
                 "file_path": fp,
                 "url": url,
                 "original_filename": r.get("original_filename") or "",
+                "image_type": r.get("image_type") or "general",
                 "created_at": _format_image_created_at(r.get("created_at")),
             }
         )
@@ -481,7 +724,7 @@ def images_to_json_list(rows):
 def fetch_task_image_rows(cursor, task_id):
     cursor.execute(
         """
-        SELECT image_id, task_id, file_path, original_filename, created_at
+        SELECT image_id, task_id, file_path, original_filename, image_type, created_at
         FROM task_images WHERE task_id = %s ORDER BY image_id ASC
         """,
         (task_id,),
@@ -495,7 +738,7 @@ def count_task_images(cursor, task_id):
     return int(row.get("c") or 0)
 
 
-def insert_task_images(cursor, task_id, files_storage_list):
+def insert_task_images(cursor, task_id, files_storage_list, image_type="general"):
     """上传文件写入磁盘并插入 task_images 表，返回 (新增行列表, 提示信息)"""
     current = count_task_images(cursor, task_id)
     remaining = TASK_PHOTO_MAX_PER_TASK - current
@@ -508,10 +751,10 @@ def insert_task_images(cursor, task_id, files_storage_list):
     for rel, orig in disk_saved:
         cursor.execute(
             """
-            INSERT INTO task_images (task_id, file_path, original_filename)
-            VALUES (%s, %s, %s)
+            INSERT INTO task_images (task_id, file_path, original_filename, image_type)
+            VALUES (%s, %s, %s, %s)
             """,
-            (task_id, rel, orig[:255] if orig else None),
+            (task_id, rel, orig[:255] if orig else None, image_type),
         )
         inserted.append(
             {
@@ -519,6 +762,7 @@ def insert_task_images(cursor, task_id, files_storage_list):
                 "task_id": task_id,
                 "file_path": rel,
                 "original_filename": orig,
+                "image_type": image_type,
             }
         )
     msg = f"成功上传 {len(inserted)} 张"
@@ -546,9 +790,13 @@ def delete_task_image_by_id(cursor, task_id, image_id):
 def fetch_task_for_detail(cursor, task_id):
     cursor.execute(
         """
-        SELECT t.*, s.full_name AS assigned_staff_name
+        SELECT t.*, s.full_name AS assigned_staff_name,
+               h.full_name AS helper_staff_name,
+               settler.full_name AS settler_name
         FROM maintenance_tasks t
         LEFT JOIN staff_basic_info s ON t.assigned_staff_id = s.staff_id
+        LEFT JOIN staff_basic_info h ON t.helper_staff_id = h.staff_id
+        LEFT JOIN staff_basic_info settler ON t.settled_by = settler.staff_id
         WHERE t.task_id = %s
         """,
         (task_id,),
@@ -941,7 +1189,7 @@ def _stat_rows_for_export(rows, view):
             "处理中": r["in_progress"],
             "已派单": r["assigned"],
             "待派单": r["pending"],
-            "待回执": r["awaiting_receipt"],
+            "待回执": r.get("awaiting_receipt", 0),
             "已取消": r["cancelled"],
             "有效工单": r["effective"],
             "完成率(%)": r["completion_pct"] if r["completion_pct"] is not None else "",
@@ -1342,6 +1590,10 @@ def login():
     next_url = request.args.get("next") or request.form.get("next") or url_for("tasks_page")
     if not str(next_url).startswith("/"):
         next_url = url_for("tasks_page")
+    if request.method == "GET":
+        # 清除非登录相关的残留 flash 消息
+        from flask import get_flashed_messages
+        get_flashed_messages()
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "").strip()
@@ -1401,7 +1653,7 @@ def login():
                     return redirect(url_for("login", next=next_url))
 
                 role_level = int(user.get("role_level") or 1)
-                role = "admin" if role_level >= 3 else ("leader" if role_level == 2 else "user")
+                role = "admin" if role_level >= 3 else ("project_admin" if role_level == 2 else "user")
                 display_name = user.get("display_name") or user["username"]
             else:
                 if not user["is_active"]:
@@ -1412,15 +1664,58 @@ def login():
                     return redirect(url_for("login", next=next_url))
                 role = user["role"]
                 display_name = user["display_name"]
-                role_level = 3 if role == "admin" else (2 if role == "leader" else 1)
+                role_level = 3 if role == "admin" else (2 if role == "project_admin" else 1)
 
             session["user_id"] = user["user_id"]
             session["username"] = user["username"]
             session["display_name"] = display_name
             session["role"] = role
             session["role_level"] = role_level
-            session["staff_id"] = user.get("staff_id")
+            staff_id_for_loc = user.get("staff_id")
+            session["staff_id"] = staff_id_for_loc
+            # 登录定位暂时关闭（保留上次记录）
+            # if staff_id_for_loc:
+            #     try:
+            #         client_ip = request.headers.get("X-Forwarded-For", request.remote_addr) or ""
+            #         prov, ct = _ip_to_province_city(client_ip)
+            #         if prov or ct:
+            #             loc_conn = get_db_connection()
+            #             if loc_conn:
+            #                 try:
+            #                     loc_cur = loc_conn.cursor()
+            #                     loc_cur.execute(
+            #                         "UPDATE staff_basic_info SET location_province=%s, location_city=%s, location_updated_at=NOW() WHERE staff_id=%s",
+            #                         (prov, ct, staff_id_for_loc),
+            #                     )
+            #                     loc_conn.commit()
+            #                     loc_cur.close()
+            #                 finally:
+            #                     if loc_conn and getattr(loc_conn, "open", False):
+            #                         loc_conn.close()
+            #     except Exception:
+            #         pass
             flash(f"欢迎回来，{display_name}", "success")
+            # 检查是否有待确认的援助工单
+            try:
+                staff_id_val = session.get("staff_id")
+                if staff_id_val:
+                    _chk_conn = get_db_connection()
+                    if _chk_conn:
+                        try:
+                            _chk_cur = _chk_conn.cursor()
+                            _chk_cur.execute(
+                                "SELECT COUNT(*) AS cnt FROM maintenance_tasks WHERE helper_staff_id=%s AND helper_status='pending'",
+                                (staff_id_val,),
+                            )
+                            _cnt = int((_chk_cur.fetchone() or {}).get("cnt") or 0)
+                            if _cnt > 0:
+                                flash(f"您有 {_cnt} 个工单的援助申请待确认，请前往任务列表处理", "warning")
+                            _chk_cur.close()
+                        finally:
+                            if _chk_conn and getattr(_chk_conn, "open", False):
+                                _chk_conn.close()
+            except Exception:
+                pass
             return redirect(next_url)
         except Exception as e:
             flash(f"登录失败: {str(e)}", "danger")
@@ -1531,6 +1826,7 @@ def task_detail(task_id):
     cursor = None
     try:
         ensure_task_images_table(connection)
+        ensure_task_settlements_table(connection)
         migrate_legacy_task_photos(connection)
         cursor = connection.cursor()
         task = fetch_task_for_detail(cursor, task_id)
@@ -1538,11 +1834,39 @@ def task_detail(task_id):
             flash("未找到该工单", "danger")
             return redirect(url_for("tasks_page"))
         images = _json_task_images(cursor, task_id)
+        user = get_current_user()
+        current_staff_id = user.get("staff_id") if user else None
+        is_assignee = current_staff_id and task.get("assigned_staff_id") == current_staff_id
+        is_helper = (
+            current_staff_id
+            and task.get("helper_staff_id") == current_staff_id
+            and task.get("helper_status") == "accepted"
+        )
+        can_operate = bool(is_assignee or is_helper)
+        # SLA超时：派单后8小时未到达
+        sla_overdue = False
+        if task.get("assigned_at") and not task.get("arrived_at") and task.get("status") in ("已派单", "处理中"):
+            delta = datetime.now() - task["assigned_at"]
+            sla_overdue = delta.total_seconds() >= 8 * 3600
+        # 供申请援助用：在职员工列表（排除自己和当前执行人）
+        staff_options = []
+        if is_assignee and task.get("helper_status") not in ("admin_pending", "pending", "accepted"):
+            cursor.execute(
+                "SELECT staff_id, full_name FROM staff_basic_info WHERE is_active=1 AND staff_id != %s ORDER BY full_name",
+                (current_staff_id,),
+            )
+            staff_options = cursor.fetchall()
         return render_template_string(
             TASK_DETAIL_HTML,
             task=task,
             images=images,
             max_photos=TASK_PHOTO_MAX_PER_TASK,
+            can_operate=can_operate,
+            is_assignee=is_assignee,
+            is_helper=is_helper,
+            staff_options=staff_options,
+            today=date.today(),
+            sla_overdue=sla_overdue,
         )
     except Exception as e:
         flash(f"读取工单失败: {str(e)}", "danger")
@@ -1593,18 +1917,40 @@ def api_task_images_upload(task_id):
     try:
         ensure_task_images_table(connection)
         cursor = connection.cursor()
-        if not fetch_task_for_detail(cursor, task_id):
+        task = fetch_task_for_detail(cursor, task_id)
+        if not task:
             return jsonify({"ok": False, "message": "工单不存在"}), 404
+        user = get_current_user()
+        current_staff_id = user.get("staff_id") if user else None
+        role_level = user.get("role_level", 1) if user else 1
+        is_assignee = current_staff_id and task.get("assigned_staff_id") == current_staff_id
+        is_helper = (
+            current_staff_id
+            and task.get("helper_staff_id") == current_staff_id
+            and task.get("helper_status") == "accepted"
+        )
+        if role_level < 2 and not is_assignee and not is_helper:
+            return jsonify({"ok": False, "message": "无权限上传照片"}), 403
+        image_type = request.form.get("image_type", "general")
+        if image_type not in ("arrival", "completion", "general"):
+            image_type = "general"
         files = request.files.getlist("photos")
         if not files or not any(getattr(f, "filename", None) for f in files):
             return jsonify({"ok": False, "message": "请选择要上传的图片"}), 400
-        inserted, msg = insert_task_images(cursor, task_id, files)
+        inserted, msg = insert_task_images(cursor, task_id, files, image_type=image_type)
         if not inserted:
             return jsonify({"ok": False, "message": msg}), 400
-        cursor.execute(
-            "UPDATE maintenance_tasks SET status = '待回执', updated_at = NOW() WHERE task_id = %s AND status NOT IN ('已完成', '已取消')",
-            (task_id,),
-        )
+        current_status = task.get("status", "")
+        if image_type == "arrival" and current_status == "已派单":
+            cursor.execute(
+                "UPDATE maintenance_tasks SET status='处理中', arrived_at=NOW(), updated_at=NOW() WHERE task_id=%s",
+                (task_id,),
+            )
+        elif image_type == "completion" and current_status == "处理中":
+            cursor.execute(
+                "UPDATE maintenance_tasks SET status='待回执', completed_at=NOW(), updated_at=NOW() WHERE task_id=%s",
+                (task_id,),
+            )
         connection.commit()
         all_images = _json_task_images(cursor, task_id)
         return jsonify({"ok": True, "message": msg, "images": all_images})
@@ -1649,16 +1995,11 @@ def api_task_image_delete(task_id, image_id):
             connection.close()
 
 
-@app.route("/api/ip_location")
-def api_ip_location():
-    """通过客户端IP查询省市（ip-api.com，无需Key）"""
-    if not is_logged_in():
-        return jsonify({"ok": False, "message": "请先登录"}), 401
+def _ip_to_province_city(client_ip):
+    """通过IP查询省市，返回 (province, city) 或 (None, None)"""
     import urllib.request as _urlreq
-    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr) or ""
     if "," in client_ip:
         client_ip = client_ip.split(",")[0].strip()
-    # 本地/内网IP回退到空串让ip-api自动检测
     if client_ip in ("127.0.0.1", "::1") or client_ip.startswith("192.168.") or client_ip.startswith("10."):
         client_ip = ""
     try:
@@ -1668,12 +2009,24 @@ def api_ip_location():
             result = json.loads(resp.read().decode())
         if result.get("status") == "success":
             province = result.get("regionName", "")
-            province = province.replace("省", "").replace("自治区", "").replace("特别行政区", "").replace("壮族", "").replace("回族", "").replace("维吾尔", "")
+            for s in ("省", "自治区", "特别行政区", "壮族", "回族", "维吾尔"):
+                province = province.replace(s, "")
             city = result.get("city", "").replace("市", "")
-            return jsonify({"ok": True, "province": province, "city": city})
-        return jsonify({"ok": False, "message": "IP定位返回失败"})
-    except Exception as e:
-        return jsonify({"ok": False, "message": str(e)})
+            return province or None, city or None
+    except Exception:
+        pass
+    return None, None
+
+
+@app.route("/api/ip_location")
+def api_ip_location():
+    if not is_logged_in():
+        return jsonify({"ok": False, "message": "请先登录"}), 401
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr) or ""
+    prov, ct = _ip_to_province_city(client_ip)
+    if prov or ct:
+        return jsonify({"ok": True, "province": prov or "", "city": ct or ""})
+    return jsonify({"ok": False, "message": "IP定位失败"})
 
 
 @app.route("/api/staff/location", methods=["POST"])
@@ -1943,8 +2296,11 @@ def tasks_page():
         return render_template_string(
             TASKS_PAGE_HTML,
             task_list=[],
-            task_stats={"total": 0, "pending": 0, "in_progress": 0, "done": 0},
+            task_stats={"total": 0, "pending": 0, "assigned": 0, "in_progress": 0, "awaiting_receipt": 0, "done": 0, "archived": 0},
+            my_stats=None,
+            admin_help_pending=0,
             filters={"status": "", "priority": "", "keyword": ""},
+            today=date.today(),
         )
 
     try:
@@ -1959,12 +2315,12 @@ def tasks_page():
         where_parts = []
         params = []
 
-        # 权限1只能看待派单及派给自己的工单；权限2和3可查看全部
+        # 权限1只能看待派单及派给自己的工单（含援助工单）；权限2和3可查看全部
         if get_current_role_level() == 1:
             current_staff_id = session.get("staff_id")
             if current_staff_id:
-                where_parts.append("(t.assigned_staff_id = %s OR t.status = '待派单')")
-                params.append(current_staff_id)
+                where_parts.append("(t.assigned_staff_id = %s OR t.status = '待派单' OR (t.helper_staff_id = %s AND t.helper_status IN ('pending','accepted')))")
+                params.extend([current_staff_id, current_staff_id])
             else:
                 where_parts.append("t.status = '待派单'")
 
@@ -2026,7 +2382,9 @@ def tasks_page():
                 SUM(CASE WHEN status = '处理中' THEN 1 ELSE 0 END) AS in_progress,
                 SUM(CASE WHEN status = '待回执' THEN 1 ELSE 0 END) AS awaiting_receipt,
                 SUM(CASE WHEN status = '已完成' THEN 1 ELSE 0 END) AS done,
-                SUM(CASE WHEN status = '已取消' THEN 1 ELSE 0 END) AS cancelled
+                SUM(CASE WHEN status = '已取消' THEN 1 ELSE 0 END) AS cancelled,
+                SUM(CASE WHEN status = '已归档' THEN 1 ELSE 0 END) AS archived,
+                SUM(CASE WHEN status = '已挂起' THEN 1 ELSE 0 END) AS suspended
             FROM maintenance_tasks
             """
         )
@@ -2038,23 +2396,66 @@ def tasks_page():
             "in_progress": int(stats_raw.get("in_progress") or 0),
             "awaiting_receipt": int(stats_raw.get("awaiting_receipt") or 0),
             "done": int(stats_raw.get("done") or 0),
+            "archived": int(stats_raw.get("archived") or 0),
+            "suspended": int(stats_raw.get("suspended") or 0),
         }
+
+        # 权限1和2：查询个人待接取和待完成任务数
+        my_stats = None
+        if get_current_role_level() <= 2:
+            current_staff_id = session.get("staff_id")
+            cursor.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN status = '待派单' THEN 1 ELSE 0 END) AS to_accept,
+                    SUM(CASE WHEN status IN ('已派单','处理中','待回执') AND assigned_staff_id = %s THEN 1 ELSE 0 END) AS to_finish,
+                    SUM(CASE WHEN status = '已挂起' AND assigned_staff_id = %s THEN 1 ELSE 0 END) AS suspended
+                FROM maintenance_tasks
+                """,
+                (current_staff_id, current_staff_id),
+            )
+            r = cursor.fetchone() or {}
+            my_stats = {
+                "to_accept": int(r.get("to_accept") or 0),
+                "to_finish": int(r.get("to_finish") or 0),
+                "suspended": int(r.get("suspended") or 0),
+            }
 
         cursor.close()
         connection.close()
+
+        admin_help_pending = 0
+        if get_current_role_level() >= 2:
+            _conn2 = get_db_connection()
+            if _conn2:
+                try:
+                    _cur2 = _conn2.cursor()
+                    _cur2.execute("SELECT COUNT(*) AS cnt FROM maintenance_tasks WHERE helper_status='admin_pending'")
+                    admin_help_pending = int((_cur2.fetchone() or {}).get("cnt") or 0)
+                    _cur2.close()
+                finally:
+                    if _conn2 and getattr(_conn2, "open", False):
+                        _conn2.close()
+
         return render_template_string(
             TASKS_PAGE_HTML,
             task_list=task_list,
             task_stats=task_stats,
+            my_stats=my_stats,
+            admin_help_pending=admin_help_pending,
             filters={"status": status_filter, "priority": priority_filter, "keyword": keyword},
+            today=date.today(),
         )
     except Exception as e:
         flash(f'获取任务数据失败: {str(e)}', 'danger')
         return render_template_string(
             TASKS_PAGE_HTML,
             task_list=[],
-            task_stats={"total": 0, "pending": 0, "in_progress": 0, "done": 0},
+            task_stats={"total": 0, "pending": 0, "assigned": 0, "in_progress": 0, "awaiting_receipt": 0, "done": 0, "archived": 0},
+            my_stats=None,
+            admin_help_pending=0,
             filters={"status": "", "priority": "", "keyword": ""},
+            today=date.today(),
         )
 
 
@@ -2163,7 +2564,7 @@ def staff_page():
     connection = get_db_connection()
     if not connection:
         flash('数据库连接失败', 'danger')
-        return render_template_string(STAFF_PAGE_HTML, staff_list=[])
+        return render_template_string(STAFF_PAGE_HTML, staff_list=[], return_rates={})
 
     try:
         ensure_staff_columns(connection)
@@ -2184,12 +2585,21 @@ def staff_page():
                 cursor.execute("SELECT * FROM staff_basic_info ORDER BY staff_id LIMIT 100")
 
         staff_list = cursor.fetchall()
+        # 批量查询退回率和挂起率（管理员视图）
+        return_rates = {}
+        suspend_rates = {}
+        if user and user.get('role_level', 1) >= 2:
+            for s in staff_list:
+                rc, ac, rt = _get_return_rate(cursor, s['staff_id'])
+                return_rates[s['staff_id']] = {'cnt': rc, 'assigned': ac, 'rate': rt}
+                sc, _, st = _get_suspend_rate(cursor, s['staff_id'])
+                suspend_rates[s['staff_id']] = {'cnt': sc, 'rate': st}
         cursor.close()
         connection.close()
-        return render_template_string(STAFF_PAGE_HTML, staff_list=staff_list)
+        return render_template_string(STAFF_PAGE_HTML, staff_list=staff_list, return_rates=return_rates, suspend_rates=suspend_rates)
     except Exception as e:
         flash(f'获取员工数据失败: {str(e)}', 'danger')
-        return render_template_string(STAFF_PAGE_HTML, staff_list=[])
+        return render_template_string(STAFF_PAGE_HTML, staff_list=[], return_rates={}, suspend_rates={})
 
 # 添加员工路由
 @app.route('/add_staff', methods=['GET', 'POST'])
@@ -2366,8 +2776,6 @@ def edit_staff(staff_id):
             department_val = department if department else None
             team_name_val = team_name if team_name else None
             home_address_val = request.form.get('home_address', '').strip() or None
-            location_province_val = request.form.get('location_province', '').strip() or None
-            location_city_val = request.form.get('location_city', '').strip() or None
 
             # 更新数据
             cursor.execute('''
@@ -2377,7 +2785,6 @@ def edit_staff(staff_id):
                 education = %s, entry_date = %s, departure_date = %s,
                 is_active = %s, region_id = %s, team_id = %s, team_name = %s,
                 position = %s, department = %s, home_address = %s,
-                location_province = %s, location_city = %s, location_updated_at = IF(%s IS NOT NULL, NOW(), location_updated_at),
                 updated_at = NOW()
             WHERE staff_id = %s
             ''', (
@@ -2385,7 +2792,6 @@ def edit_staff(staff_id):
                 emergency_contact, emergency_phone, education_val, entry_date,
                 departure_date_val, is_active, region_id_val, team_id_val, team_name_val,
                 position, department_val, home_address_val,
-                location_province_val, location_city_val, location_province_val,
                 staff_id
             ))
             
@@ -2448,15 +2854,19 @@ def view_staff(staff_id):
         return redirect(url_for('staff_page'))
     try:
         ensure_staff_columns(connection)
+        ensure_maintenance_tasks_table(connection)
         cursor = connection.cursor()
         cursor.execute("SELECT * FROM staff_basic_info WHERE staff_id = %s", (staff_id,))
         staff = cursor.fetchone()
-        cursor.close()
-        connection.close()
         if not staff:
+            cursor.close()
+            connection.close()
             flash('未找到该员工信息', 'danger')
             return redirect(url_for('staff_page'))
-        return render_template_string(MY_PROFILE_HTML, staff=staff)
+        rc, ac, rt = _get_return_rate(cursor, staff_id)
+        cursor.close()
+        connection.close()
+        return render_template_string(MY_PROFILE_HTML, staff=staff, return_rate={'cnt': rc, 'assigned': ac, 'rate': rt})
     except Exception as e:
         flash(f'获取员工信息失败: {str(e)}', 'danger')
         return redirect(url_for('staff_page'))
@@ -2477,15 +2887,19 @@ def my_profile():
         return redirect(url_for('tasks_page'))
     try:
         ensure_staff_columns(connection)
+        ensure_maintenance_tasks_table(connection)
         cursor = connection.cursor()
         cursor.execute("SELECT * FROM staff_basic_info WHERE staff_id = %s", (staff_id,))
         staff = cursor.fetchone()
-        cursor.close()
-        connection.close()
         if not staff:
+            cursor.close()
+            connection.close()
             flash('未找到员工信息，请联系管理员', 'warning')
             return redirect(url_for('tasks_page'))
-        return render_template_string(MY_PROFILE_HTML, staff=staff)
+        rc, ac, rt = _get_return_rate(cursor, staff_id)
+        cursor.close()
+        connection.close()
+        return render_template_string(MY_PROFILE_HTML, staff=staff, return_rate={'cnt': rc, 'assigned': ac, 'rate': rt})
     except Exception as e:
         flash(f'获取员工信息失败: {str(e)}', 'danger')
         return redirect(url_for('tasks_page'))
@@ -2613,6 +3027,7 @@ def _fetch_staff_options(connection, active_only=True):
 
 
 @app.route("/add_task", methods=["GET", "POST"])
+@require_role_level(2)
 def add_task():
     if request.method == "POST":
         connection = get_db_connection()
@@ -2653,20 +3068,32 @@ def add_task():
                     flash("截止日期格式错误（请使用 YYYY-MM-DD）", "danger")
                     return redirect(url_for("add_task"))
 
+            source_report_id_raw = request.form.get("source_report_id", "").strip()
+            reporter_user_id_raw = request.form.get("reporter_user_id", "").strip()
+            try:
+                source_report_id = int(source_report_id_raw) if source_report_id_raw else None
+            except ValueError:
+                source_report_id = None
+            try:
+                reporter_user_id = int(reporter_user_id_raw) if reporter_user_id_raw else None
+            except ValueError:
+                reporter_user_id = None
+
             ensure_task_images_table(connection)
             cursor.execute(
                 """
                 INSERT INTO maintenance_tasks
-                (title, description, fault_type, customer_address, fault_phenomenon, resolution_method, priority, status, due_date)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, '待派单', %s)
+                (title, description, fault_type, customer_address, fault_phenomenon, resolution_method, priority, status, due_date, source_report_id, reporter_user_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, '待派单', %s, %s, %s)
                 """,
                 (title, description or None, fault_type or None, customer_address or None,
-                 fault_phenomenon or None, resolution_method or None, priority, due_date),
+                 fault_phenomenon or None, resolution_method or None, priority, due_date,
+                 source_report_id, reporter_user_id),
             )
             new_id = cursor.lastrowid
 
             # 智能自动派单
-            auto_staff_id, auto_name, auto_dist, auto_tasks = _auto_assign_staff(cursor, fault_type, task_lat, task_lng)
+            auto_staff_id, auto_name, auto_dist, auto_tasks = _auto_assign_staff(cursor, fault_type, task_lat, task_lng, customer_address)
             if auto_staff_id:
                 cursor.execute(
                     """UPDATE maintenance_tasks SET assigned_staff_id=%s, assigned_at=NOW(), status='已派单', updated_at=NOW()
@@ -2677,6 +3104,13 @@ def add_task():
                 flash(f"任务已添加，已自动派单给 {auto_name}（当前 {auto_tasks} 个任务{dist_str}）", "success")
             else:
                 flash("任务已添加，暂无合适员工，请手动派单", "warning")
+
+            # 关联上报记录：更新 issue_report 状态为处理中
+            if source_report_id:
+                cursor.execute(
+                    "UPDATE issue_reports SET status='处理中' WHERE report_id=%s",
+                    (source_report_id,)
+                )
 
             connection.commit()
             return redirect(url_for("task_detail", task_id=new_id))
@@ -2696,10 +3130,20 @@ def add_task():
 
     return render_template_string(ADD_TASK_HTML, priorities=TASK_PRIORITIES,
         fault_business_types=FAULT_BUSINESS_TYPES, fault_phenomena=FAULT_PHENOMENA,
-        resolution_methods=RESOLUTION_METHODS, fault_types_need_phenomenon=list(FAULT_TYPES_NEED_PHENOMENON))
+        resolution_methods=RESOLUTION_METHODS, fault_types_need_phenomenon=list(FAULT_TYPES_NEED_PHENOMENON),
+        prefill={
+            "title": request.args.get("title", ""),
+            "fault_type": request.args.get("fault_type", ""),
+            "customer_address": request.args.get("customer_address", ""),
+            "contact_name": request.args.get("contact_name", ""),
+            "contact_phone": request.args.get("contact_phone", ""),
+            "source_report_id": request.args.get("source_report_id", ""),
+            "reporter_user_id": request.args.get("reporter_user_id", ""),
+        })
 
 
 @app.route("/edit_task/<int:task_id>", methods=["GET", "POST"])
+@require_role_level(2)
 def edit_task(task_id):
     connection = get_db_connection()
     if not connection:
@@ -2961,7 +3405,7 @@ def claim_task(task_id):
 
 @app.route("/return_task/<int:task_id>", methods=["POST"])
 def return_task(task_id):
-    """普通用户退回自己执行的工单到待派单状态"""
+    """普通用户退回自己执行的工单，检查退回率后重新智能派单"""
     current_staff_id = session.get("staff_id")
     if not current_staff_id:
         flash("您的账号未绑定员工信息，无法操作", "danger")
@@ -2975,23 +3419,56 @@ def return_task(task_id):
     try:
         ensure_maintenance_tasks_table(connection)
         cursor = connection.cursor()
+
+        # 退回率检查（最近30天退回≥3次且退回率>20%则禁止）
+        return_cnt, assigned_cnt, rate = _get_return_rate(cursor, current_staff_id)
+        if return_cnt >= 3 and rate > 0.20:
+            flash(f"您最近30天退回率为 {rate*100:.0f}%（{return_cnt}/{assigned_cnt}），已超过限制，无法退回工单", "danger")
+            return redirect(url_for("tasks_page"))
+
+        # 读取工单信息（用于重新派单）
         cursor.execute(
-            """
-            UPDATE maintenance_tasks SET
-                assigned_staff_id = NULL,
-                assigned_at = NULL,
-                status = '待派单',
-                updated_at = NOW()
-            WHERE task_id = %s AND assigned_staff_id = %s AND status NOT IN ('已完成', '已取消')
-            """,
+            "SELECT fault_type, customer_address FROM maintenance_tasks WHERE task_id=%s AND assigned_staff_id=%s AND status NOT IN ('已完成','已取消')",
             (task_id, current_staff_id),
         )
-        if cursor.rowcount == 0:
-            connection.rollback()
+        task = cursor.fetchone()
+        if not task:
             flash("退回失败：工单不存在、不属于您、或已完成/已取消", "warning")
+            return redirect(url_for("tasks_page"))
+
+        # 记录退回日志
+        cursor.execute(
+            "INSERT INTO task_return_log (task_id, staff_id) VALUES (%s, %s)",
+            (task_id, current_staff_id),
+        )
+
+        # 更新工单：退回并记录退回人
+        cursor.execute(
+            """UPDATE maintenance_tasks SET
+                assigned_staff_id=NULL, assigned_at=NULL, status='待派单',
+                returned_by=%s, return_count=return_count+1, updated_at=NOW()
+               WHERE task_id=%s""",
+            (current_staff_id, task_id),
+        )
+
+        # 立即重新智能派单（排除退回人）
+        fault_type = task.get("fault_type") or ""
+        customer_address = task.get("customer_address") or ""
+        auto_id, auto_name, _, auto_tasks = _auto_assign_staff(
+            cursor, fault_type, None, None,
+            task_address=customer_address,
+            exclude_staff_id=current_staff_id,
+        )
+        if auto_id:
+            cursor.execute(
+                "UPDATE maintenance_tasks SET assigned_staff_id=%s, assigned_at=NOW(), status='已派单', updated_at=NOW() WHERE task_id=%s",
+                (auto_id, task_id),
+            )
+            flash(f"工单已退回，已重新派单给 {auto_name}（当前 {auto_tasks} 个任务）", "success")
         else:
-            connection.commit()
-            flash("工单已退回待派单", "success")
+            flash("工单已退回，暂无其他合适员工，请管理员手动派单", "warning")
+
+        connection.commit()
         return redirect(url_for("tasks_page"))
     except Exception as e:
         if connection:
@@ -3006,6 +3483,524 @@ def return_task(task_id):
                 pass
         if connection and getattr(connection, "open", False):
             connection.close()
+
+
+@app.route("/request_help/<int:task_id>", methods=["POST"])
+def request_help(task_id):
+    """执行人向其他员工发起援助申请"""
+    current_staff_id = session.get("staff_id")
+    if not current_staff_id:
+        flash("您的账号未绑定员工信息，无法操作", "danger")
+        return redirect(url_for("task_detail", task_id=task_id))
+
+    helper_staff_id = request.form.get("helper_staff_id", "").strip()
+    if not helper_staff_id:
+        flash("请选择援助人员", "danger")
+        return redirect(url_for("task_detail", task_id=task_id))
+
+    connection = get_db_connection()
+    if not connection:
+        flash("数据库连接失败", "danger")
+        return redirect(url_for("task_detail", task_id=task_id))
+    cursor = None
+    try:
+        ensure_maintenance_tasks_table(connection)
+        cursor = connection.cursor()
+        cursor.execute(
+            "SELECT assigned_staff_id, status, helper_status FROM maintenance_tasks WHERE task_id=%s",
+            (task_id,),
+        )
+        task = cursor.fetchone()
+        if not task:
+            flash("工单不存在", "danger")
+            return redirect(url_for("tasks_page"))
+        if task.get("assigned_staff_id") != current_staff_id:
+            flash("只有执行人才能申请援助", "danger")
+            return redirect(url_for("task_detail", task_id=task_id))
+        if task.get("status") in ("已完成", "已取消"):
+            flash("已完成或已取消的工单无法申请援助", "danger")
+            return redirect(url_for("task_detail", task_id=task_id))
+        if task.get("helper_status") in ("admin_pending", "pending", "accepted"):
+            flash("该工单已有援助申请，无法重复申请", "warning")
+            return redirect(url_for("task_detail", task_id=task_id))
+        if int(helper_staff_id) == current_staff_id:
+            flash("不能邀请自己作为援助人", "danger")
+            return redirect(url_for("task_detail", task_id=task_id))
+        cursor.execute("SELECT full_name FROM staff_basic_info WHERE staff_id=%s AND is_active=1", (helper_staff_id,))
+        helper = cursor.fetchone()
+        if not helper:
+            flash("所选员工不存在或已离职", "danger")
+            return redirect(url_for("task_detail", task_id=task_id))
+        cursor.execute(
+            "UPDATE maintenance_tasks SET helper_staff_id=%s, helper_requested_at=NOW(), helper_status='admin_pending', helper_accepted_at=NULL, helper_admin_note=NULL WHERE task_id=%s",
+            (helper_staff_id, task_id),
+        )
+        connection.commit()
+        flash(f"援助申请已提交，等待管理员审核（被邀请人：{helper['full_name']}）", "success")
+        return redirect(url_for("task_detail", task_id=task_id))
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        flash(f"申请援助失败: {str(e)}", "danger")
+        return redirect(url_for("task_detail", task_id=task_id))
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if connection and getattr(connection, "open", False):
+            connection.close()
+
+
+@app.route("/respond_help/<int:task_id>", methods=["POST"])
+def respond_help(task_id):
+    """援助人接受或拒绝援助申请"""
+    current_staff_id = session.get("staff_id")
+    if not current_staff_id:
+        flash("您的账号未绑定员工信息，无法操作", "danger")
+        return redirect(url_for("tasks_page"))
+
+    action = request.form.get("action", "").strip()
+    if action not in ("accept", "reject"):
+        flash("无效操作", "danger")
+        return redirect(url_for("task_detail", task_id=task_id))
+
+    connection = get_db_connection()
+    if not connection:
+        flash("数据库连接失败", "danger")
+        return redirect(url_for("task_detail", task_id=task_id))
+    cursor = None
+    try:
+        ensure_maintenance_tasks_table(connection)
+        cursor = connection.cursor()
+        cursor.execute(
+            "SELECT helper_staff_id, helper_status FROM maintenance_tasks WHERE task_id=%s",
+            (task_id,),
+        )
+        task = cursor.fetchone()
+        if not task:
+            flash("工单不存在", "danger")
+            return redirect(url_for("tasks_page"))
+        if task.get("helper_staff_id") != current_staff_id:
+            flash("您不是该工单的援助邀请对象", "danger")
+            return redirect(url_for("task_detail", task_id=task_id))
+        if task.get("helper_status") != "pending":
+            flash("该援助申请已处理", "warning")
+            return redirect(url_for("task_detail", task_id=task_id))
+        if action == "accept":
+            cursor.execute(
+                "UPDATE maintenance_tasks SET helper_status='accepted', helper_accepted_at=NOW() WHERE task_id=%s",
+                (task_id,),
+            )
+            connection.commit()
+            flash("已接受援助申请", "success")
+        else:
+            cursor.execute(
+                "UPDATE maintenance_tasks SET helper_status='rejected', helper_staff_id=NULL, helper_requested_at=NULL WHERE task_id=%s",
+                (task_id,),
+            )
+            connection.commit()
+            flash("已拒绝援助申请", "info")
+        return redirect(url_for("task_detail", task_id=task_id))
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        flash(f"操作失败: {str(e)}", "danger")
+        return redirect(url_for("task_detail", task_id=task_id))
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if connection and getattr(connection, "open", False):
+            connection.close()
+
+
+@app.route("/review_help/<int:task_id>", methods=["POST"])
+def review_help(task_id):
+    """项目管理员/系统管理员审核援助申请（批准或拒绝）"""
+    user = get_current_user()
+    if not user or user.get("role_level", 1) < 2:
+        flash("无权限操作，仅项目管理员及以上可审核援助申请", "danger")
+        return redirect(url_for("task_detail", task_id=task_id))
+
+    action = request.form.get("action", "").strip()
+    if action not in ("approve", "reject"):
+        flash("无效操作", "danger")
+        return redirect(url_for("task_detail", task_id=task_id))
+
+    connection = get_db_connection()
+    if not connection:
+        flash("数据库连接失败", "danger")
+        return redirect(url_for("task_detail", task_id=task_id))
+    cursor = None
+    try:
+        ensure_maintenance_tasks_table(connection)
+        cursor = connection.cursor()
+        cursor.execute(
+            "SELECT helper_staff_id, helper_status FROM maintenance_tasks WHERE task_id=%s",
+            (task_id,),
+        )
+        task = cursor.fetchone()
+        if not task:
+            flash("工单不存在", "danger")
+            return redirect(url_for("tasks_page"))
+        if task.get("helper_status") != "admin_pending":
+            flash("该援助申请不在待审核状态", "warning")
+            return redirect(url_for("task_detail", task_id=task_id))
+        note = request.form.get("note", "").strip() or None
+        if action == "approve":
+            cursor.execute(
+                "UPDATE maintenance_tasks SET helper_status='pending', helper_admin_note=%s WHERE task_id=%s",
+                (note, task_id),
+            )
+            connection.commit()
+            flash("已批准援助申请，等待援助人确认", "success")
+        else:
+            cursor.execute(
+                "UPDATE maintenance_tasks SET helper_status='admin_rejected', helper_staff_id=NULL, helper_requested_at=NULL, helper_admin_note=%s WHERE task_id=%s",
+                (note, task_id),
+            )
+            connection.commit()
+            flash("已拒绝援助申请", "info")
+        return redirect(url_for("task_detail", task_id=task_id))
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        flash(f"操作失败: {str(e)}", "danger")
+        return redirect(url_for("task_detail", task_id=task_id))
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if connection and getattr(connection, "open", False):
+            connection.close()
+
+
+@app.route("/settle_task/<int:task_id>", methods=["POST"])
+def settle_task(task_id):
+    """项目管理员/系统管理员确认结算工单"""
+    user = get_current_user()
+    if not user or user.get("role_level", 1) < 2:
+        flash("无权限操作", "danger")
+        return redirect(url_for("task_detail", task_id=task_id))
+
+    connection = get_db_connection()
+    if not connection:
+        flash("数据库连接失败", "danger")
+        return redirect(url_for("task_detail", task_id=task_id))
+    cursor = None
+    try:
+        ensure_maintenance_tasks_table(connection)
+        ensure_task_settlements_table(connection)
+        cursor = connection.cursor()
+        cursor.execute(
+            "SELECT assigned_staff_id, status FROM maintenance_tasks WHERE task_id=%s",
+            (task_id,),
+        )
+        task = cursor.fetchone()
+        if not task:
+            flash("工单不存在", "danger")
+            return redirect(url_for("tasks_page"))
+        if task.get("status") != "待回执":
+            flash("只有「待回执」状态的工单才能确认完成", "warning")
+            return redirect(url_for("task_detail", task_id=task_id))
+        notes = request.form.get("notes", "").strip()
+        settled_by = user.get("staff_id") or 0
+        cursor.execute(
+            "UPDATE maintenance_tasks SET status='已完成', settled_at=NOW(), settled_by=%s, updated_at=NOW() WHERE task_id=%s AND status='待回执'",
+            (settled_by, task_id),
+        )
+        if cursor.rowcount > 0:
+            cursor.execute(
+                "INSERT INTO task_settlements (task_id, staff_id, settled_by, notes) VALUES (%s, %s, %s, %s)",
+                (task_id, task.get("assigned_staff_id") or 0, settled_by, notes or None),
+            )
+        connection.commit()
+        flash("工单已确认完成", "success")
+        return redirect(url_for("task_detail", task_id=task_id))
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        flash(f"操作失败: {str(e)}", "danger")
+        return redirect(url_for("task_detail", task_id=task_id))
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if connection and getattr(connection, "open", False):
+            connection.close()
+
+
+@app.route("/suspend_task/<int:task_id>", methods=["POST"])
+def suspend_task(task_id):
+    user = get_current_user()
+    if not user:
+        flash("请先登录", "danger")
+        return redirect(url_for("task_detail", task_id=task_id))
+
+    connection = get_db_connection()
+    if not connection:
+        flash("数据库连接失败", "danger")
+        return redirect(url_for("task_detail", task_id=task_id))
+    cursor = None
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            "SELECT assigned_staff_id, status, helper_status, helper_staff_id FROM maintenance_tasks WHERE task_id=%s",
+            (task_id,),
+        )
+        task = cursor.fetchone()
+        if not task:
+            flash("工单不存在", "danger")
+            return redirect(url_for("tasks_page"))
+
+        staff_id = user.get("staff_id")
+        is_assignee = task.get("assigned_staff_id") == staff_id
+        is_accepted_helper = (
+            task.get("helper_status") == "accepted"
+            and task.get("helper_staff_id") == staff_id
+        )
+        can_operate = is_assignee or is_accepted_helper
+
+        if not can_operate:
+            flash("无权限操作", "danger")
+            return redirect(url_for("task_detail", task_id=task_id))
+        if task.get("status") != "处理中":
+            flash("只有「处理中」状态的工单才能挂起", "warning")
+            return redirect(url_for("task_detail", task_id=task_id))
+
+        reason = request.form.get("reason", "").strip()
+        if not reason:
+            flash("挂起原因不能为空", "warning")
+            return redirect(url_for("task_detail", task_id=task_id))
+
+        # 挂起次数检查（最近30天≥3次且挂起率>20%则禁止）
+        suspend_cnt, s_assigned_cnt, s_rate = _get_suspend_rate(cursor, staff_id)
+        if suspend_cnt >= 3 and s_rate > 0.20:
+            flash(f"您最近30天挂起率为 {s_rate*100:.0f}%（{suspend_cnt}/{s_assigned_cnt}），已超过限制，无法挂起工单", "danger")
+            return redirect(url_for("task_detail", task_id=task_id))
+
+        cursor.execute(
+            "UPDATE maintenance_tasks SET status='已挂起', suspended_at=NOW(), suspended_by=%s, suspend_reason=%s, updated_at=NOW() WHERE task_id=%s AND status='处理中'",
+            (staff_id, reason, task_id),
+        )
+        cursor.execute(
+            "INSERT INTO task_suspend_log (task_id, staff_id) VALUES (%s, %s)",
+            (task_id, staff_id),
+        )
+        connection.commit()
+        flash(f"工单已挂起，原因：{reason}", "success")
+        return redirect(url_for("task_detail", task_id=task_id))
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        flash(f"操作失败: {str(e)}", "danger")
+        return redirect(url_for("task_detail", task_id=task_id))
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if connection and getattr(connection, "open", False):
+            connection.close()
+
+
+@app.route("/resume_task/<int:task_id>", methods=["POST"])
+def resume_task(task_id):
+    user = get_current_user()
+    if not user:
+        flash("请先登录", "danger")
+        return redirect(url_for("task_detail", task_id=task_id))
+
+    connection = get_db_connection()
+    if not connection:
+        flash("数据库连接失败", "danger")
+        return redirect(url_for("task_detail", task_id=task_id))
+    cursor = None
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            "SELECT assigned_staff_id, status, helper_status, helper_staff_id FROM maintenance_tasks WHERE task_id=%s",
+            (task_id,),
+        )
+        task = cursor.fetchone()
+        if not task:
+            flash("工单不存在", "danger")
+            return redirect(url_for("tasks_page"))
+
+        staff_id = user.get("staff_id")
+        role_level = user.get("role_level", 1)
+        is_assignee = task.get("assigned_staff_id") == staff_id
+        is_accepted_helper = (
+            task.get("helper_status") == "accepted"
+            and task.get("helper_staff_id") == staff_id
+        )
+        can_resume = is_assignee or is_accepted_helper or role_level >= 2
+
+        if not can_resume:
+            flash("无权限操作", "danger")
+            return redirect(url_for("task_detail", task_id=task_id))
+        if task.get("status") != "已挂起":
+            flash("只有「已挂起」状态的工单才能恢复", "warning")
+            return redirect(url_for("task_detail", task_id=task_id))
+
+        cursor.execute(
+            "UPDATE maintenance_tasks SET status='处理中', updated_at=NOW() WHERE task_id=%s AND status='已挂起'",
+            (task_id,),
+        )
+        connection.commit()
+        flash("工单已恢复，继续处理中", "success")
+        return redirect(url_for("task_detail", task_id=task_id))
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        flash(f"操作失败: {str(e)}", "danger")
+        return redirect(url_for("task_detail", task_id=task_id))
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if connection and getattr(connection, "open", False):
+            connection.close()
+
+
+@app.route("/issue_reports")
+@require_role_level(2)
+def issue_reports_admin():
+    connection = get_db_connection()
+    if not connection:
+        flash("数据库连接失败", "danger")
+        return redirect(url_for("tasks_page"))
+    try:
+        with connection.cursor() as cur:
+            cur.execute("""
+                SELECT r.*, u.real_name AS user_real_name, u.phone AS user_phone,
+                       t.task_id AS linked_task_id, t.status AS linked_task_status
+                FROM issue_reports r
+                LEFT JOIN end_users u ON r.user_id = u.user_id
+                LEFT JOIN maintenance_tasks t ON t.source_report_id = r.report_id
+                ORDER BY r.created_at DESC
+            """)
+            raw = cur.fetchall()
+            # 用关联工单的实时状态覆盖上报状态显示
+            reports = []
+            for row in raw:
+                row = dict(row)
+                if row.get("linked_task_status"):
+                    row["display_status"] = row["linked_task_status"]
+                else:
+                    row["display_status"] = row["status"]
+                reports.append(row)
+    except Exception:
+        reports = []
+    finally:
+        connection.close()
+    return render_template_string(ISSUE_REPORTS_ADMIN_HTML, reports=reports)
+
+
+ISSUE_REPORTS_ADMIN_HTML = '''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>用户上报列表 - 装维部门</title>
+    <style>
+        body { font-family: "Microsoft YaHei", sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        header { background: #2c3e50; color: white; padding: 15px 20px; border-radius: 5px; margin-bottom: 16px; }
+        header h1 { margin: 0; font-size: 1.35rem; }
+        header p { margin: 6px 0 0; font-size: 13px; opacity: 0.9; }
+        .card { background: white; border-radius: 5px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .btn { display: inline-block; padding: 6px 14px; background: #3498db; color: white; border: none; border-radius: 4px; cursor: pointer; text-decoration: none; font-size: 13px; }
+        .btn-success { background: #2ecc71; }
+        .btn-light { background: #ecf0f1; color: #2c3e50; }
+        .module-nav { display: flex; gap: 4px; margin-bottom: 20px; background: white; border-radius: 5px; padding: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.06); width: fit-content; }
+        .module-nav a { padding: 10px 22px; text-decoration: none; color: #555; border-radius: 4px; font-weight: 500; font-size: 14px; }
+        .module-nav a.active { background: #3498db; color: white; }
+        .module-nav a:not(.active):hover { background: #ecf0f1; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #e5e7eb; font-size: 14px; vertical-align: middle; }
+        th { background: #f9fafb; font-weight: 600; color: #374151; }
+        .pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+        .pill-pending { background: #fef3c7; color: #92400e; }
+        .pill-processing { background: #dbeafe; color: #1e40af; }
+        .pill-done { background: #d1fae5; color: #065f46; }
+        .flash-messages { margin-bottom: 16px; padding: 10px; border-radius: 4px; }
+        .alert-success { background: #dff0d8; color: #3c763d; border: 1px solid #d6e9c6; }
+        .alert-danger { background: #f2dede; color: #a94442; border: 1px solid #ebccd1; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <header>
+        <h1>装维部门管理系统</h1>
+        <p>用户上报管理</p>
+    </header>
+    <nav class="module-nav">
+        <a href="{{ url_for('tasks_page') }}">任务管理</a>
+        <a href="{{ url_for('issue_reports_admin') }}" class="active">用户上报</a>
+        {% if current_user and current_user.role_level >= 2 %}
+        <a href="{{ url_for('staff_page') }}">员工管理</a>
+        {% endif %}
+        {% if current_user and current_user.role_level >= 3 %}
+        <a href="{{ url_for('task_statistics') }}">数据统计</a>
+        <a href="{{ url_for('account_management') }}">账号管理</a>
+        {% endif %}
+    </nav>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}<div class="flash-messages">{% for cat, msg in messages %}<div class="alert-{{ cat }}">{{ msg }}</div>{% endfor %}</div>{% endif %}
+    {% endwith %}
+    <div class="card">
+        <h2 style="margin:0 0 16px;font-size:18px;">用户上报列表</h2>
+        {% if reports %}
+        <table>
+            <thead><tr>
+                <th>编号</th><th>用户</th><th>联系人</th><th>业务类型</th><th>标题</th><th>上报时间</th><th>状态</th><th>操作</th>
+            </tr></thead>
+            <tbody>
+            {% for r in reports %}
+            <tr>
+                <td>#{{ r.report_id }}</td>
+                <td>{{ r.user_real_name or '—' }}<br><small style="color:#6b7280;">{{ r.user_phone or '' }}</small></td>
+                <td>{{ r.contact_name or '—' }}<br><small style="color:#6b7280;">{{ r.contact_phone or '' }}</small></td>
+                <td>{{ r.fault_type or '—' }}</td>
+                <td>{{ r.title }}</td>
+                <td style="white-space:nowrap;">{{ r.created_at.strftime('%Y-%m-%d %H:%M') if r.created_at else '—' }}</td>
+                <td>
+                    {% if r.display_status == 'pending' %}<span class="pill pill-pending">待处理</span>
+                    {% elif r.display_status in ('已派单', '处理中', '待回执') %}<span class="pill pill-processing">{{ r.display_status }}</span>
+                    {% elif r.display_status == '已归档' %}<span class="pill" style="background:#e0e7ff;color:#3730a3;">已归档</span>
+                    {% elif r.display_status in ('已完成',) %}<span class="pill pill-done">已完成</span>
+                    {% else %}<span class="pill pill-pending">{{ r.display_status }}</span>{% endif %}
+                </td>
+                <td>
+                <td>
+                    {% if r.linked_task_id %}
+                    <a href="{{ url_for('task_detail', task_id=r.linked_task_id) }}" style="color:#1d4ed8;text-decoration:none;font-size:13px;">工单 #{{ r.linked_task_id }}<br><small>{{ r.linked_task_status }}</small></a>
+                    {% else %}
+                    <a href="{{ url_for('add_task') }}?title={{ r.title|urlencode }}&fault_type={{ (r.fault_type or '')|urlencode }}&customer_address={{ (r.customer_address or '')|urlencode }}&contact_name={{ (r.contact_name or '')|urlencode }}&contact_phone={{ (r.contact_phone or '')|urlencode }}&source_report_id={{ r.report_id }}&reporter_user_id={{ r.user_id }}" class="btn btn-success">创建工单</a>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <p style="text-align:center;color:#9ca3af;padding:24px 0;">暂无用户上报</p>
+        {% endif %}
+    </div>
+</div>
+</body></html>'''
 
 
 LOGIN_HTML = '''
@@ -3221,10 +4216,12 @@ TASK_STATISTICS_HTML = '''
 
         <nav class="module-nav" aria-label="模块切换">
             <a href="{{ url_for('tasks_page') }}">任务管理</a>
+            <a href="{{ url_for('issue_reports_admin') }}">用户上报</a>
             <a href="{{ url_for('staff_page') }}">员工管理</a>
             <a href="{{ url_for('task_statistics') }}" class="active">数据统计</a>
             <a href="{{ url_for('account_management') }}">账号管理</a>
         </nav>
+        {% with messages = get_flashed_messages(with_categories=true) %}
           {% if messages %}
             <div class="flash-messages">
               {% for category, message in messages %}
@@ -3301,7 +4298,7 @@ TASK_STATISTICS_HTML = '''
                 </div>
                 <div class="summary-item">
                     <p class="summary-label">待回执</p>
-                    <p class="summary-value">{{ stat.summary.awaiting_receipt }}</p>
+                    <p class="summary-value">{{ stat.summary.awaiting_receipt or 0 }}</p>
                 </div>
             </div>
         </div>
@@ -3455,10 +4452,13 @@ TASKS_PAGE_HTML = '''
         .status-待回执 { color: #862e9c; background: #f3d9fa; }
         .status-已完成 { color: #1a7f37; background: #dafbe1; }
         .status-已取消 { color: #cf222e; background: #ffebe9; }
+        .status-已归档 { color: #3730a3; background: #e0e7ff; }
+        .status-已挂起 { color: #92400e; background: #fef3c7; }
         .priority-高 { color: #cf222e; background: #ffebe9; }
         .priority-中 { color: #9a6700; background: #fff4d6; }
         .priority-低 { color: #1a7f37; background: #dafbe1; }
-        .action-buttons { display: flex; gap: 8px; flex-wrap: wrap; }
+        .action-buttons { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+        .action-buttons form { margin: 0; }
         .flash-messages { margin-bottom: 20px; padding: 10px; border-radius: 4px; }
         .alert-success { background-color: #dff0d8; color: #3c763d; border: 1px solid #d6e9c6; }
         .alert-danger { background-color: #f2dede; color: #a94442; border: 1px solid #ebccd1; }
@@ -3516,6 +4516,7 @@ TASKS_PAGE_HTML = '''
         <nav class="module-nav" aria-label="模块切换">
             <a href="{{ url_for('tasks_page') }}" class="active">任务管理</a>
             {% if current_user and current_user.role_level >= 2 %}
+            <a href="{{ url_for('issue_reports_admin') }}">用户上报</a>
             <a href="{{ url_for('staff_page') }}">员工管理</a>
             {% else %}
             <a href="{{ url_for('my_profile') }}">个人信息</a>
@@ -3545,6 +4546,55 @@ TASKS_PAGE_HTML = '''
             </div>
           {% endif %}
         {% endwith %}
+
+        {% if my_stats %}
+        <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px;">
+            {% if my_stats.to_accept > 0 %}
+            <div style="flex:1;min-width:180px;background:#fff4d6;border:1px solid #f59e0b;border-radius:8px;padding:12px 16px;display:flex;align-items:center;gap:10px;">
+                <span style="font-size:24px;">📋</span>
+                <div>
+                    <div style="font-size:13px;color:#92400e;">待接取任务</div>
+                    <div style="font-size:22px;font-weight:700;color:#b45309;">{{ my_stats.to_accept }}</div>
+                </div>
+            </div>
+            {% endif %}
+            {% if my_stats.to_finish > 0 %}
+            <div style="flex:1;min-width:180px;background:#dbeafe;border:1px solid #3b82f6;border-radius:8px;padding:12px 16px;display:flex;align-items:center;gap:10px;">
+                <span style="font-size:24px;">🔧</span>
+                <div>
+                    <div style="font-size:13px;color:#1e40af;">待完成任务</div>
+                    <div style="font-size:22px;font-weight:700;color:#1d4ed8;">{{ my_stats.to_finish }}</div>
+                </div>
+            </div>
+            {% endif %}
+            {% if my_stats.suspended > 0 %}
+            <div style="flex:1;min-width:180px;background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;padding:12px 16px;display:flex;align-items:center;gap:10px;">
+                <span style="font-size:24px;">⏸️</span>
+                <div>
+                    <div style="font-size:13px;color:#92400e;">已挂起工单</div>
+                    <div style="font-size:22px;font-weight:700;color:#b45309;">{{ my_stats.suspended }}</div>
+                </div>
+            </div>
+            {% endif %}
+            {% if my_stats.to_accept == 0 and my_stats.to_finish == 0 and my_stats.suspended == 0 %}
+            <div style="flex:1;background:#d1fae5;border:1px solid #10b981;border-radius:8px;padding:12px 16px;display:flex;align-items:center;gap:10px;">
+                <span style="font-size:24px;">✅</span>
+                <div style="font-size:14px;color:#065f46;font-weight:600;">暂无待处理任务</div>
+            </div>
+            {% endif %}
+        </div>
+        {% endif %}
+
+        {% if current_user and current_user.role_level >= 2 and admin_help_pending > 0 %}
+        <div style="display:flex;align-items:center;gap:10px;background:#fef3c7;border:1px solid #fde68a;border-radius:8px;padding:12px 16px;margin-bottom:16px;">
+            <span style="font-size:22px;">🆘</span>
+            <div>
+                <div style="font-size:13px;color:#92400e;">待审核援助申请</div>
+                <div style="font-size:22px;font-weight:700;color:#b45309;">{{ admin_help_pending }}</div>
+            </div>
+            <div style="margin-left:auto;font-size:13px;color:#78350f;">请前往相关工单详情页审核</div>
+        </div>
+        {% endif %}
 
         <div class="card">
             <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
@@ -3577,6 +4627,14 @@ TASKS_PAGE_HTML = '''
                     <p class="summary-label">已完成</p>
                     <p class="summary-value">{{ task_stats.done }}</p>
                 </div>
+                <div class="summary-item">
+                    <p class="summary-label">已归档</p>
+                    <p class="summary-value">{{ task_stats.archived }}</p>
+                </div>
+                <div class="summary-item">
+                    <p class="summary-label">已挂起</p>
+                    <p class="summary-value">{{ task_stats.suspended }}</p>
+                </div>
             </div>
 
             <form method="get" class="filters">
@@ -3594,6 +4652,8 @@ TASKS_PAGE_HTML = '''
                         <option value="待回执" {% if filters.status == '待回执' %}selected{% endif %}>待回执</option>
                         <option value="已完成" {% if filters.status == '已完成' %}selected{% endif %}>已完成</option>
                         <option value="已取消" {% if filters.status == '已取消' %}selected{% endif %}>已取消</option>
+                        <option value="已归档" {% if filters.status == '已归档' %}selected{% endif %}>已归档</option>
+                        <option value="已挂起" {% if filters.status == '已挂起' %}selected{% endif %}>已挂起</option>
                     </select>
                 </div>
                 <div class="field">
@@ -3610,6 +4670,10 @@ TASKS_PAGE_HTML = '''
             </form>
 
             <table class="task-table">
+                <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>标题</th>
                     <th>优先级</th>
                     <th>截止日期</th>
                     <th>状态</th>
@@ -3618,6 +4682,8 @@ TASKS_PAGE_HTML = '''
                     <th>现场照片</th>
                     <th>操作</th>
                 </tr>
+                </thead>
+                <tbody>
                 {% for t in task_list %}
                 <tr>
                     <td>{{ t.task_id }}</td>
@@ -3628,8 +4694,18 @@ TASKS_PAGE_HTML = '''
                         </div>
                     </td>
                     <td><span class="pill priority-{{ t.priority }}">{{ t.priority }}</span></td>
-                    <td>{{ t.due_date or '—' }}</td>
-                    <td><span class="pill status-{{ t.status }}">{{ t.status }}</span></td>
+                    <td>
+                        {{ t.due_date or '—' }}
+                        {% if t.due_date and t.due_date < today and t.status not in ['已完成','已取消','已归档'] %}
+                        <span class="pill" style="background:#ffebe9;color:#cf222e;margin-left:4px;">已超时</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <span class="pill status-{{ t.status }}">{{ t.status }}</span>
+                        {% if current_user and current_user.role_level >= 2 and t.helper_status == 'admin_pending' %}
+                        <span class="pill" style="background:#fef3c7;color:#92400e;margin-left:4px;">待审核援助</span>
+                        {% endif %}
+                    </td>
                     <td>{{ t.assigned_staff_name or '—' }}</td>
                     <td>{{ t.assigned_at or '—' }}</td>
                     <td>
@@ -3637,7 +4713,8 @@ TASKS_PAGE_HTML = '''
                             {% if t.photo_count %}查看（{{ t.photo_count }}）{% else %}上传/查看{% endif %}
                         </a>
                     </td>
-                    <td class="action-buttons">
+                    <td>
+                        <div class="action-buttons">
                         <a href="{{ url_for('task_detail', task_id=t.task_id) }}" class="btn btn-light">详情</a>
                         {% if current_user and current_user.role_level >= 2 %}
                         <a href="{{ url_for('edit_task', task_id=t.task_id) }}" class="btn btn-warning">编辑</a>
@@ -3646,15 +4723,26 @@ TASKS_PAGE_HTML = '''
                         <a href="{{ url_for('assign_task', task_id=t.task_id) }}" class="btn btn-primary">派单</a>
                         {% endif %}
                         {% if t.status == '待派单' and current_user and current_user.role_level < 3 %}
-                        <form method="post" action="{{ url_for('claim_task', task_id=t.task_id) }}" style="display:inline;">
+                        <form method="post" action="{{ url_for('claim_task', task_id=t.task_id) }}">
                             <button type="submit" class="btn btn-success" onclick="return confirm('确认接取该工单？')">接取</button>
                         </form>
                         {% endif %}
                         {% if current_user and current_user.role_level < 3 and t.assigned_staff_id == current_user.staff_id and t.status not in ['已完成', '已取消', '待派单'] %}
-                        <form method="post" action="{{ url_for('return_task', task_id=t.task_id) }}" style="display:inline;">
+                        <form method="post" action="{{ url_for('return_task', task_id=t.task_id) }}">
                             <button type="submit" class="btn btn-danger" onclick="return confirm('确认退回该工单？退回后将回到待派单状态。')">退回</button>
                         </form>
                         {% endif %}
+                        {% if current_user and current_user.staff_id == t.helper_staff_id and t.helper_status == 'pending' %}
+                        <form method="post" action="{{ url_for('respond_help', task_id=t.task_id) }}">
+                            <input type="hidden" name="action" value="accept">
+                            <button type="submit" class="btn btn-success btn-sm">接受援助</button>
+                        </form>
+                        <form method="post" action="{{ url_for('respond_help', task_id=t.task_id) }}">
+                            <input type="hidden" name="action" value="reject">
+                            <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('确认拒绝？')">拒绝</button>
+                        </form>
+                        {% endif %}
+                        </div>
                     </td>
                 </tr>
                 {% else %}
@@ -3662,6 +4750,7 @@ TASKS_PAGE_HTML = '''
                     <td colspan="9" style="text-align: center; padding: 20px;">暂无任务，点击「添加任务」创建</td>
                 </tr>
                 {% endfor %}
+                </tbody>
             </table>
 
             <!-- 手机端卡片列表 -->
@@ -3670,7 +4759,12 @@ TASKS_PAGE_HTML = '''
                 <div class="task-card">
                     <div class="task-card-header">
                         <div class="task-card-title">{{ t.title }}</div>
-                        <span class="pill status-{{ t.status }}">{{ t.status }}</span>
+                        <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;">
+                            <span class="pill status-{{ t.status }}">{{ t.status }}</span>
+                            {% if current_user and current_user.role_level >= 3 and t.helper_status == 'admin_pending' %}
+                            <span class="pill" style="background:#fef3c7;color:#92400e;">待审核援助</span>
+                            {% endif %}
+                        </div>
                     </div>
                     <div class="task-card-meta">
                         <span><span class="pill priority-{{ t.priority }}">{{ t.priority }}</span></span>
@@ -3698,14 +4792,64 @@ TASKS_PAGE_HTML = '''
                             <button type="submit" class="btn btn-danger" onclick="return confirm('确认退回该工单？')">退回</button>
                         </form>
                         {% endif %}
+                        {% if current_user and current_user.staff_id == t.helper_staff_id and t.helper_status == 'pending' %}
+                        <form method="post" action="{{ url_for('respond_help', task_id=t.task_id) }}" style="display:inline;">
+                            <input type="hidden" name="action" value="accept">
+                            <button type="submit" class="btn btn-success btn-sm">接受援助</button>
+                        </form>
+                        <form method="post" action="{{ url_for('respond_help', task_id=t.task_id) }}" style="display:inline;">
+                            <input type="hidden" name="action" value="reject">
+                            <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('确认拒绝？')">拒绝</button>
+                        </form>
+                        {% endif %}
                     </div>
                 </div>
                 {% else %}
                 <p style="text-align:center;color:#9ca3af;padding:24px 0;">暂无任务</p>
                 {% endfor %}
             </div>
+            <div id="task-pagination" style="display:flex;justify-content:center;align-items:center;gap:6px;margin-top:16px;flex-wrap:wrap;"></div>
         </div>
     </div>
+<script>
+(function(){
+    var PAGE_SIZE = 10;
+    var currentPage = 1;
+    function getRows() { return document.querySelectorAll('table.task-table tbody tr[data-row]'); }
+    function getCards() { return document.querySelectorAll('.task-cards .task-card'); }
+    function totalItems() { return Math.max(getRows().length, getCards().length); }
+    function showPage(page) {
+        currentPage = page;
+        var rows = getRows(), cards = getCards();
+        var total = Math.max(rows.length, cards.length);
+        var start = (page - 1) * PAGE_SIZE, end = start + PAGE_SIZE;
+        rows.forEach(function(r, i){ r.style.display = (i >= start && i < end) ? '' : 'none'; });
+        cards.forEach(function(c, i){ c.style.display = (i >= start && i < end) ? '' : 'none'; });
+        renderPager(total, page);
+    }
+    function renderPager(total, page) {
+        var pages = Math.ceil(total / PAGE_SIZE);
+        var el = document.getElementById('task-pagination');
+        if (!el || pages <= 1) { if(el) el.innerHTML=''; return; }
+        var html = '';
+        html += '<button onclick="taskPage(' + (page-1) + ')" ' + (page<=1?'disabled':'') + ' style="padding:6px 12px;border:1px solid #d1d5db;border-radius:4px;background:white;cursor:pointer;">上一页</button>';
+        for (var i = 1; i <= pages; i++) {
+            html += '<button onclick="taskPage(' + i + ')" style="padding:6px 12px;border:1px solid ' + (i===page?'#3498db':'#d1d5db') + ';border-radius:4px;background:' + (i===page?'#3498db':'white') + ';color:' + (i===page?'white':'#374151') + ';cursor:pointer;">' + i + '</button>';
+        }
+        html += '<button onclick="taskPage(' + (page+1) + ')" ' + (page>=pages?'disabled':'') + ' style="padding:6px 12px;border:1px solid #d1d5db;border-radius:4px;background:white;cursor:pointer;">下一页</button>';
+        html += '<span style="font-size:13px;color:#6b7280;">共 ' + total + ' 条</span>';
+        el.innerHTML = html;
+    }
+    window.taskPage = function(p) {
+        var pages = Math.ceil(totalItems() / PAGE_SIZE);
+        if (p < 1 || p > pages) return;
+        showPage(p);
+    };
+    // 给表格行加 data-row 标记
+    document.querySelectorAll('table.task-table tbody tr').forEach(function(r, i){ r.setAttribute('data-row', i); });
+    showPage(1);
+})();
+</script>
 </body>
 </html>
 '''
@@ -3739,9 +4883,10 @@ STAFF_PAGE_HTML = '''
         .btn-danger { background-color: #e74c3c; }
         .card { background-color: white; border-radius: 5px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
         table { width: 100%; border-collapse: collapse; margin-top: 15px; }
-        th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #ddd; }
+        th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #ddd; vertical-align: middle; }
         th { background-color: #ecf0f1; }
-        .action-buttons { display: flex; gap: 8px; flex-wrap: wrap; }
+        .action-buttons { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+        .action-buttons form { margin: 0; }
         .import-form { margin-top: 15px; padding: 15px; border: 1px dashed #bdc3c7; border-radius: 4px; }
         .form-group { margin-bottom: 15px; }
         label { display: block; margin-bottom: 5px; font-weight: bold; }
@@ -3786,6 +4931,7 @@ STAFF_PAGE_HTML = '''
         <nav class="module-nav" aria-label="模块切换">
             <a href="{{ url_for('tasks_page') }}">任务管理</a>
             {% if current_user and current_user.role_level >= 2 %}
+            <a href="{{ url_for('issue_reports_admin') }}">用户上报</a>
             <a href="{{ url_for('staff_page') }}" class="active">员工管理</a>
             {% else %}
             <a href="{{ url_for('my_profile') }}" class="active">个人信息</a>
@@ -3818,6 +4964,7 @@ STAFF_PAGE_HTML = '''
                 </div>
             </div>
             <table class="staff-table">
+                <thead>
                 <tr>
                     <th>ID</th>
                     <th>姓名</th>
@@ -3828,8 +4975,11 @@ STAFF_PAGE_HTML = '''
                     <th>位置</th>
                     <th>入职日期</th>
                     <th>在职状态</th>
+                    {% if current_user and current_user.role_level >= 2 %}<th>退回率(30天)</th><th>挂起率(30天)</th>{% endif %}
                     <th>操作</th>
                 </tr>
+                </thead>
+                <tbody>
                 {% for staff in staff_list %}
                 <tr>
                     <td>{{ staff.staff_id }}</td>
@@ -3838,9 +4988,19 @@ STAFF_PAGE_HTML = '''
                     <td>{{ staff.department or '—' }}</td>
                     <td>{{ staff.team_name or (('班组 ' ~ staff.team_id) if staff.team_id else '—') }}</td>
                     <td>{{ staff.home_address or '—' }}</td>
-                    <td>{% if staff.latitude and staff.longitude %}📍{% if staff.location_updated_at %}<br><small style="color:#9ca3af;">{{ staff.location_updated_at }}</small>{% endif %}{% else %}—{% endif %}</td>
+                    <td>{% if staff.location_province %}📍 {{ staff.location_province }}{{ staff.location_city or '' }}{% if staff.location_updated_at %}<br><small style="color:#9ca3af;">{{ staff.location_updated_at }}</small>{% endif %}{% else %}—{% endif %}</td>
                     <td>{{ staff.entry_date }}</td>
                     <td>{{ '在职' if staff.is_active else '离职' }}</td>
+                    {% if current_user and current_user.role_level >= 2 %}
+                    <td>{% set rr = return_rates.get(staff.staff_id, {}) %}{% if rr.cnt %}
+                        <span style="color:{% if rr.rate > 0.2 %}#dc2626{% elif rr.rate > 0.1 %}#d97706{% else %}#15803d{% endif %};">{{ (rr.rate*100)|int }}%</span>
+                        <small style="color:#9ca3af;">（{{ rr.cnt }}/{{ rr.assigned }}）</small>
+                    {% else %}—{% endif %}</td>
+                    <td>{% set sr = suspend_rates.get(staff.staff_id, {}) %}{% if sr.cnt %}
+                        <span style="color:{% if sr.rate > 0.2 %}#dc2626{% elif sr.rate > 0.1 %}#d97706{% else %}#15803d{% endif %};">{{ (sr.rate*100)|int }}%</span>
+                        <small style="color:#9ca3af;">（{{ sr.cnt }}次）</small>
+                    {% else %}—{% endif %}</td>
+                    {% endif %}
                     <td class="action-buttons">
                         <a href="{{ url_for('view_staff', staff_id=staff.staff_id) }}" class="btn btn-primary">查看</a>
                         {% if current_user and (current_user.role_level >= 3 or current_user.staff_id == staff.staff_id) %}
@@ -3858,6 +5018,7 @@ STAFF_PAGE_HTML = '''
                     <td colspan="8" style="text-align: center; padding: 20px;">暂无员工信息</td>
                 </tr>
                 {% endfor %}
+                </tbody>
             </table>
 
             <!-- 手机端员工卡片列表 -->
@@ -3869,8 +5030,9 @@ STAFF_PAGE_HTML = '''
                         {% if staff.department %}部门：{{ staff.department }}<br>{% endif %}
                         班组：{{ staff.team_name or (('班组 ' ~ staff.team_id) if staff.team_id else '未分配') }}<br>
                         {% if staff.home_address %}地址：{{ staff.home_address }}<br>{% endif %}
-                        {% if staff.latitude and staff.longitude %}📍 已记录GPS{% if staff.location_updated_at %}（{{ staff.location_updated_at }}）{% endif %}<br>{% endif %}
+                        {% if staff.location_province %}📍 {{ staff.location_province }}{{ staff.location_city or '' }}{% if staff.location_updated_at %}（{{ staff.location_updated_at }}）{% endif %}<br>{% endif %}
                         入职：{{ staff.entry_date }} · {{ '在职' if staff.is_active else '离职' }}
+                        {% if current_user and current_user.role_level >= 2 %}{% set rr = return_rates.get(staff.staff_id, {}) %}{% if rr.cnt %}<br>退回率：<span style="color:{% if rr.rate > 0.2 %}#dc2626{% elif rr.rate > 0.1 %}#d97706{% else %}#15803d{% endif %};">{{ (rr.rate*100)|int }}%</span>（{{ rr.cnt }}/{{ rr.assigned }}）{% endif %}{% endif %}
                     </div>
                     <div class="staff-card-actions">
                         {% if current_user and (current_user.role_level >= 3 or current_user.staff_id == staff.staff_id) %}
@@ -3887,6 +5049,7 @@ STAFF_PAGE_HTML = '''
                 <p style="text-align:center;color:#9ca3af;padding:24px 0;">暂无员工信息</p>
                 {% endfor %}
             </div>
+            <div id="staff-pagination" style="display:flex;justify-content:center;align-items:center;gap:6px;margin-top:16px;flex-wrap:wrap;"></div>
         </div>
 
         <div class="card" id="staff-import">
@@ -3905,6 +5068,44 @@ STAFF_PAGE_HTML = '''
             </div>
         </div>
     </div>
+<script>
+(function(){
+    var PAGE_SIZE = 10;
+    var currentPage = 1;
+    function getRows() { return document.querySelectorAll('table.staff-table tbody tr[data-row]'); }
+    function getCards() { return document.querySelectorAll('.staff-cards .staff-card'); }
+    function totalItems() { return Math.max(getRows().length, getCards().length); }
+    function showPage(page) {
+        currentPage = page;
+        var rows = getRows(), cards = getCards();
+        var total = Math.max(rows.length, cards.length);
+        var start = (page - 1) * PAGE_SIZE, end = start + PAGE_SIZE;
+        rows.forEach(function(r, i){ r.style.display = (i >= start && i < end) ? '' : 'none'; });
+        cards.forEach(function(c, i){ c.style.display = (i >= start && i < end) ? '' : 'none'; });
+        renderPager(total, page);
+    }
+    function renderPager(total, page) {
+        var pages = Math.ceil(total / PAGE_SIZE);
+        var el = document.getElementById('staff-pagination');
+        if (!el || pages <= 1) { if(el) el.innerHTML=''; return; }
+        var html = '';
+        html += '<button onclick="staffPage(' + (page-1) + ')" ' + (page<=1?'disabled':'') + ' style="padding:6px 12px;border:1px solid #d1d5db;border-radius:4px;background:white;cursor:pointer;">上一页</button>';
+        for (var i = 1; i <= pages; i++) {
+            html += '<button onclick="staffPage(' + i + ')" style="padding:6px 12px;border:1px solid ' + (i===page?'#3498db':'#d1d5db') + ';border-radius:4px;background:' + (i===page?'#3498db':'white') + ';color:' + (i===page?'white':'#374151') + ';cursor:pointer;">' + i + '</button>';
+        }
+        html += '<button onclick="staffPage(' + (page+1) + ')" ' + (page>=pages?'disabled':'') + ' style="padding:6px 12px;border:1px solid #d1d5db;border-radius:4px;background:white;cursor:pointer;">下一页</button>';
+        html += '<span style="font-size:13px;color:#6b7280;">共 ' + total + ' 条</span>';
+        el.innerHTML = html;
+    }
+    window.staffPage = function(p) {
+        var pages = Math.ceil(totalItems() / PAGE_SIZE);
+        if (p < 1 || p > pages) return;
+        showPage(p);
+    };
+    document.querySelectorAll('table.staff-table tbody tr').forEach(function(r, i){ r.setAttribute('data-row', i); });
+    showPage(1);
+})();
+</script>
 </body>
 </html>
 '''
@@ -3966,6 +5167,7 @@ ACCOUNT_MANAGEMENT_HTML = '''
         </header>
         <nav class="module-nav" aria-label="模块切换">
             <a href="{{ url_for('tasks_page') }}">任务管理</a>
+            <a href="{{ url_for('issue_reports_admin') }}">用户上报</a>
             <a href="{{ url_for('staff_page') }}">员工管理</a>
             <a href="{{ url_for('task_statistics') }}">数据统计</a>
             <a href="{{ url_for('account_management') }}" class="active">账号管理</a>
@@ -4009,7 +5211,7 @@ ACCOUNT_MANAGEMENT_HTML = '''
                         <form method="post" action="{{ url_for('update_account_permission', user_id=u.id) }}" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px;">
                             <select name="role_level" title="权限等级">
                                 <option value="1" {% if u.role_level == 1 %}selected{% endif %}>1-普通</option>
-                                <option value="2" {% if u.role_level == 2 %}selected{% endif %}>2-派发</option>
+                                <option value="2" {% if u.role_level == 2 %}selected{% endif %}>2-项目管理员</option>
                                 <option value="3" {% if u.role_level >= 3 %}selected{% endif %}>3-管理员</option>
                             </select>
                             <select name="status" title="账号状态">
@@ -4049,7 +5251,7 @@ ACCOUNT_MANAGEMENT_HTML = '''
                         <form method="post" action="{{ url_for('update_account_permission', user_id=u.id) }}">
                             <select name="role_level" title="权限等级">
                                 <option value="1" {% if u.role_level == 1 %}selected{% endif %}>1-普通</option>
-                                <option value="2" {% if u.role_level == 2 %}selected{% endif %}>2-派发</option>
+                                <option value="2" {% if u.role_level == 2 %}selected{% endif %}>2-项目管理员</option>
                                 <option value="3" {% if u.role_level >= 3 %}selected{% endif %}>3-管理员</option>
                             </select>
                             <select name="status" title="账号状态">
@@ -4259,7 +5461,14 @@ ADD_STAFF_HTML = '''
                 </div>
                 <div class="form-group">
                     <label for="department">所属部门</label>
-                    <input type="text" id="department" name="department" maxlength="50" placeholder="如：装维一部、客服部">
+                    <select id="department" name="department">
+                        <option value="">请选择</option>
+                        <option value="宽带部">宽带部</option>
+                        <option value="IPTV部">IPTV部</option>
+                        <option value="电话部">电话部</option>
+                        <option value="设备部">设备部</option>
+                        <option value="线路部">线路部</option>
+                    </select>
                 </div>
                 <div class="form-group">
                     <label for="team_id">班组ID</label>
@@ -4345,7 +5554,16 @@ MY_PROFILE_HTML = '''
             <div class="info-row"><span class="info-label">常驻地址</span><span class="info-value">{{ staff.home_address or '—' }}</span></div>
             <div class="info-row"><span class="info-label">入职日期</span><span class="info-value">{{ staff.entry_date or '—' }}</span></div>
             <div class="info-row"><span class="info-label">在职状态</span><span class="info-value">{{ '在职' if staff.is_active else '离职' }}</span></div>
-            <div class="info-row"><span class="info-label">GPS位置</span><span class="info-value">{% if staff.latitude and staff.longitude %}📍 已记录{% if staff.location_updated_at %}（{{ staff.location_updated_at }}）{% endif %}{% else %}未记录{% endif %}</span></div>
+            <div class="info-row"><span class="info-label">所在位置</span><span class="info-value">{% if staff.location_province %}📍 {{ staff.location_province }}{{ staff.location_city or '' }}{% if staff.location_updated_at %}（{{ staff.location_updated_at }}）{% endif %}{% else %}未记录{% endif %}</span></div>
+            <div class="info-row"><span class="info-label">退回率(30天)</span><span class="info-value">
+                {% if return_rate and return_rate.cnt %}
+                <span style="color:{% if return_rate.rate > 0.2 %}#dc2626{% elif return_rate.rate > 0.1 %}#d97706{% else %}#15803d{% endif %};">{{ (return_rate.rate*100)|int }}%</span>
+                （退回 {{ return_rate.cnt }} 次 / 派单 {{ return_rate.assigned }} 次）
+                {% if return_rate.cnt >= 3 and return_rate.rate > 0.2 %}
+                <span style="color:#dc2626;font-weight:600;">⚠ 已超限，无法退回工单</span>
+                {% endif %}
+                {% else %}—{% endif %}
+            </span></div>
             {% if current_user and (current_user.role_level >= 3 or current_user.staff_id == staff.staff_id) %}
             <a href="{{ url_for('edit_staff', staff_id=staff.staff_id) }}" class="btn btn-warning">编辑信息</a>
             {% endif %}
@@ -4471,6 +5689,7 @@ EDIT_STAFF_HTML = '''
             <a href="{{ url_for('tasks_page') }}">任务管理</a>
             <a href="{{ url_for('staff_page') }}" class="active">员工管理</a>
             {% if current_user.role_level >= 3 %}
+            <a href="{{ url_for('issue_reports_admin') }}">用户上报</a>
             <a href="{{ url_for('task_statistics') }}">数据统计</a>
             <a href="{{ url_for('account_management') }}">账号管理</a>
             {% endif %}
@@ -4491,6 +5710,10 @@ EDIT_STAFF_HTML = '''
         <div class="card">
             <h2>编辑员工信息</h2>
             <form method="post">
+                <div class="form-group">
+                    <label for="full_name">姓名 <span class="required-mark">*</span></label>
+                    <input type="text" id="full_name" name="full_name" value="{{ staff.full_name }}" required maxlength="30" placeholder="真实姓名">
+                </div>
                 <div class="form-group">
                     <label for="gender">性别 <span class="required-mark">*</span></label>
                     <select id="gender" name="gender" required>
@@ -4540,7 +5763,14 @@ EDIT_STAFF_HTML = '''
                 </div>
                 <div class="form-group">
                     <label for="department">所属部门</label>
-                    <input type="text" id="department" name="department" value="{{ staff.department or '' }}" maxlength="50" placeholder="如：装维一部、客服部">
+                    <select id="department" name="department">
+                        <option value="">请选择</option>
+                        <option value="宽带部" {% if staff.department == '宽带部' %}selected{% endif %}>宽带部</option>
+                        <option value="IPTV部" {% if staff.department == 'IPTV部' %}selected{% endif %}>IPTV部</option>
+                        <option value="电话部" {% if staff.department == '电话部' %}selected{% endif %}>电话部</option>
+                        <option value="设备部" {% if staff.department == '设备部' %}selected{% endif %}>设备部</option>
+                        <option value="线路部" {% if staff.department == '线路部' %}selected{% endif %}>线路部</option>
+                    </select>
                 </div>
                 <div class="form-group">
                     <label for="team_id">班组ID</label>
@@ -4561,30 +5791,17 @@ EDIT_STAFF_HTML = '''
                         </select>
                     </div>
                     <input type="hidden" id="home_address" name="home_address" value="{{ staff.home_address or '' }}">
-                    <small style="color:#6b7280;font-size:12px;">当前：{{ staff.home_address or '未设置' }}</small>
+                    <small id="home_address_hint" style="color:#6b7280;font-size:12px;">当前：{{ staff.home_address or '未设置' }}</small>
                 </div>
                 <div class="form-group">
                     <label>实时位置（省市）</label>
-                    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
-                        <select id="loc_province" onchange="onLocProvinceChange()" style="flex:1;min-width:120px;">
-                            <option value="">选择省份</option>
-                        </select>
-                        <select id="loc_city" onchange="onLocCityChange()" style="flex:1;min-width:120px;">
-                            <option value="">选择城市</option>
-                        </select>
-                    </div>
-                    <input type="hidden" id="location_province" name="location_province" value="{{ staff.location_province or '' }}">
-                    <input type="hidden" id="location_city" name="location_city" value="{{ staff.location_city or '' }}">
-                    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
-                        <button type="button" class="btn btn-primary" onclick="autoLocateProvCity()" id="gps-btn">📍 自动定位省市</button>
-                        <span id="gps-status" style="font-size:13px;color:#6b7280;">
-                            {% if staff.location_province %}
-                            已记录：{{ staff.location_province }}{{ staff.location_city or '' }}{% if staff.location_updated_at %}（{{ staff.location_updated_at }}）{% endif %}
-                            {% else %}
-                            暂无位置记录
-                            {% endif %}
-                        </span>
-                    </div>
+                    <p style="margin:4px 0;font-size:13px;color:#6b7280;">
+                        {% if staff.location_province %}
+                        📍 {{ staff.location_province }}{{ staff.location_city or '' }}{% if staff.location_updated_at %}（{{ staff.location_updated_at }}）{% endif %}
+                        {% else %}
+                        暂无位置记录（登录时自动更新）
+                        {% endif %}
+                    </p>
                 </div>
                 <div class="form-group">
                     <label for="position">岗位 <span class="required-mark">*</span></label>
@@ -4605,57 +5822,83 @@ EDIT_STAFF_HTML = '''
         </div>
     </div>
 <script>
-function autoLocateProvCity() {
-    var btn = document.getElementById('gps-btn');
-    var status = document.getElementById('gps-status');
-    btn.disabled = true;
-    btn.textContent = '定位中...';
-    status.style.color = '#6b7280';
-    status.textContent = '正在通过IP查询省市...';
-    fetch('/api/ip_location').then(function(r){ return r.json(); }).then(function(d) {
-        if (!d.ok) throw new Error(d.message || 'IP定位失败');
-        var province = d.province || '';
-        var city = d.city || '';
-        document.getElementById('location_province').value = province;
-        document.getElementById('location_city').value = city;
-        setSelectValue('loc_province', province);
-        setSelectValue('loc_city', city);
-        return fetch('/api/staff/location', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({staff_id: {{ staff.staff_id }}, province: province, city: city})
-        });
-    }).then(function(r){ return r.json(); }).then(function(d) {
-        var prov = document.getElementById('location_province').value;
-        var ct = document.getElementById('location_city').value;
-        if (d.ok) {
-            status.textContent = '已定位：' + (prov || '') + (ct ? ' ' + ct : '') + '（点击保存生效）';
-            status.style.color = '#15803d';
-        } else {
-            status.textContent = '保存失败：' + d.message;
-            status.style.color = '#b91c1c';
-        }
-        btn.disabled = false;
-        btn.textContent = '📍 重新定位';
-    }).catch(function(e) {
-        status.textContent = '定位失败：' + e.message;
-        status.style.color = '#b91c1c';
-        btn.disabled = false;
-        btn.textContent = '📍 自动定位省市';
-    });
-}
+var PC={
+"北京":["东城","西城","朝阳","丰台","石景山","海淀","门头沟","房山","通州","顺义","昌平","大兴","怀柔","平谷","密云","延庆"],
+"天津":["和平","河东","河西","南开","河北","红桥","东丽","西青","津南","北辰","武清","宝坻","滨海新区","宁河","静海","蓟州"],
+"河北":["石家庄","唐山","秦皇岛","邯郸","邢台","保定","张家口","承德","沧州","廊坊","衡水"],
+"山西":["太原","大同","阳泉","长治","晋城","朔州","晋中","运城","忻州","临汾","吕梁"],
+"内蒙古":["呼和浩特","包头","乌海","赤峰","通辽","鄂尔多斯","呼伦贝尔","巴彦淖尔","乌兰察布","兴安盟","锡林郭勒盟","阿拉善盟"],
+"辽宁":["沈阳","大连","鞍山","抚顺","本溪","丹东","锦州","营口","阜新","辽阳","盘锦","铁岭","朝阳","葫芦岛"],
+"吉林":["长春","吉林","四平","辽源","通化","白山","松原","白城","延边"],
+"黑龙江":["哈尔滨","齐齐哈尔","鸡西","鹤岗","双鸭山","大庆","伊春","佳木斯","七台河","牡丹江","黑河","绥化","大兴安岭"],
+"上海":["黄浦","徐汇","长宁","静安","普陀","虹口","杨浦","闵行","宝山","嘉定","浦东新区","金山","松江","青浦","奉贤","崇明"],
+"江苏":["南京","无锡","徐州","常州","苏州","南通","连云港","淮安","盐城","扬州","镇江","泰州","宿迁"],
+"浙江":["杭州","宁波","温州","嘉兴","湖州","绍兴","金华","衢州","舟山","台州","丽水"],
+"安徽":["合肥","芜湖","蚌埠","淮南","马鞍山","淮北","铜陵","安庆","黄山","滁州","阜阳","宿州","六安","亳州","池州","宣城"],
+"福建":["福州","厦门","莆田","三明","泉州","漳州","南平","龙岩","宁德"],
+"江西":["南昌","景德镇","萍乡","九江","新余","鹰潭","赣州","吉安","宜春","抚州","上饶"],
+"山东":["济南","青岛","淄博","枣庄","东营","烟台","潍坊","济宁","泰安","威海","日照","临沂","德州","聊城","滨州","菏泽"],
+"河南":["郑州","开封","洛阳","平顶山","安阳","鹤壁","新乡","焦作","濮阳","许昌","漯河","三门峡","南阳","商丘","信阳","周口","驻马店"],
+"湖北":["武汉","黄石","十堰","宜昌","襄阳","鄂州","荆门","孝感","荆州","黄冈","咸宁","随州","恩施","仙桃","潜江","天门","神农架"],
+"湖南":["长沙","株洲","湘潭","衡阳","邵阳","岳阳","常德","张家界","益阳","郴州","永州","怀化","娄底","湘西"],
+"广东":["广州","深圳","珠海","汕头","佛山","韶关","湛江","肇庆","江门","茂名","惠州","梅州","汕尾","河源","阳江","清远","东莞","中山","潮州","揭州","云浮"],
+"广西":["南宁","柳州","桂林","梧州","北海","防城港","钦州","贵港","玉林","百色","贺州","河池","来宾","崇左"],
+"海南":["海口","三亚","三沙","儋州","五指山","琼海","文昌","万宁","东方","定安","屯昌","澄迈","临高","白沙","昌江","乐东","陵水","保亭","琼中"],
+"重庆":["万州","涪陵","渝中","大渡口","江北","沙坪坝","九龙坡","南岸","北碚","綦江","大足","渝北","巴南","黔江","长寿","江津","合川","永川","南川","璧山","铜梁","潼南","荣昌","开州","梁平","武隆","城口","丰都","垫江","忠县","云阳","奉节","巫山","巫溪","石柱","秀山","酉阳","彭水"],
+"四川":["成都","自贡","攀枝花","泸州","德阳","绵阳","广元","遂宁","内江","乐山","南充","眉山","宜宾","广安","达州","雅安","巴中","资阳","阿坝","甘孜","凉山"],
+"贵州":["贵阳","六盘水","遵义","安顺","毕节","铜仁","黔西南","黔东南","黔南"],
+"云南":["昆明","曲靖","玉溪","保山","昭通","丽江","普洱","临沧","楚雄","红河","文山","西双版纳","大理","德宏","怒江","迪庆"],
+"西藏":["拉萨","日喀则","昌都","林芝","山南","那曲","阿里"],
+"陕西":["西安","铜川","宝鸡","咸阳","渭南","延安","汉中","榆林","安康","商洛"],
+"甘肃":["兰州","嘉峪关","金昌","白银","天水","武威","张掖","平凉","酒泉","庆阳","定西","陇南","临夏","甘南"],
+"青海":["西宁","海东","海北","黄南","海南","果洛","玉树","海西"],
+"宁夏":["银川","石嘴山","吴忠","固原","中卫"],
+"新疆":["乌鲁木齐","克拉玛依","吐鲁番","哈密","昌吉","博尔塔拉","巴音郭楞","阿克苏","克孜勒苏","喀什","和田","伊犁","塔城","阿勒泰","石河子","阿拉尔","图木舒克","五家渠","北屯","铁门关","双河","可克达拉","昆玉","胡杨河"]
+};
 
-function setSelectValue(id, val) {
-    var sel = document.getElementById(id);
-    if (!sel || !val) return;
-    for (var i = 0; i < sel.options.length; i++) {
-        if (sel.options[i].value === val || sel.options[i].text === val) {
-            sel.selectedIndex = i;
-            return;
-        }
+function updateCities() {
+    var pSel = document.getElementById('province_sel');
+    var cSel = document.getElementById('city_sel');
+    var prov = pSel.value;
+    cSel.innerHTML = '<option value="">选择城市</option>';
+    if (prov && PC[prov]) {
+        PC[prov].forEach(function(c) {
+            var o = document.createElement('option');
+            o.value = c; o.textContent = c;
+            cSel.appendChild(o);
+        });
     }
+    updateHomeAddress();
 }
+function updateHomeAddress() {
+    var prov = document.getElementById('province_sel').value;
+    var city = document.getElementById('city_sel').value;
+    var val = prov ? (city ? prov + city : prov) : '';
+    document.getElementById('home_address').value = val;
+    document.getElementById('home_address_hint').textContent = '当前：' + (val || '未设置');
+}
+function initProvCity() {
+    var pSel = document.getElementById('province_sel');
+    Object.keys(PC).forEach(function(p) {
+        var o = document.createElement('option');
+        o.value = p; o.textContent = p;
+        pSel.appendChild(o);
+    });
+    var saved = document.getElementById('home_address').value || '';
+    if (!saved) return;
+    var matchedProv = '';
+    Object.keys(PC).forEach(function(p) {
+        if (saved.startsWith(p)) matchedProv = p;
+    });
+    if (!matchedProv) return;
+    pSel.value = matchedProv;
+    updateCities();
+    var city = saved.slice(matchedProv.length);
+    if (city) document.getElementById('city_sel').value = city;
+}
+document.addEventListener('DOMContentLoaded', initProvCity);
 </script>
+
 </body>
 </html>
 '''
@@ -4702,6 +5945,21 @@ TASK_DETAIL_HTML = '''
         .upload-status.ok { color: #15803d; }
         .empty-hint { color: #9ca3af; font-size: 14px; }
         .desc-block { margin-top: 12px; padding: 12px; background: #f9fafb; border-radius: 6px; font-size: 14px; line-height: 1.6; white-space: pre-wrap; }
+        .flash-messages { margin-bottom: 16px; }
+        .alert-success { background: #dff0d8; color: #3c763d; border: 1px solid #d6e9c6; padding: 10px 14px; border-radius: 4px; margin-bottom: 8px; }
+        .alert-danger  { background: #f2dede; color: #a94442; border: 1px solid #ebccd1; padding: 10px 14px; border-radius: 4px; margin-bottom: 8px; }
+        .alert-warning { background: #fcf8e3; color: #8a6d3b; border: 1px solid #faebcc; padding: 10px 14px; border-radius: 4px; margin-bottom: 8px; }
+        .alert-info    { background: #d9edf7; color: #31708f; border: 1px solid #bce8f1; padding: 10px 14px; border-radius: 4px; margin-bottom: 8px; }
+        .helper-box { background: #f0f7ff; border: 1px solid #bfdbfe; border-radius: 6px; padding: 14px 16px; margin-top: 14px; }
+        .helper-box h3 { margin: 0 0 10px 0; font-size: 14px; color: #1e40af; }
+        .flow-section { border-radius: 6px; padding: 14px 16px; margin-bottom: 12px; }
+        .flow-arrival { background: #eff6ff; border: 1px solid #bfdbfe; }
+        .flow-arrival h3 { margin: 0 0 8px 0; font-size: 14px; color: #1d4ed8; }
+        .flow-completion { background: #f0fdf4; border: 1px solid #bbf7d0; }
+        .flow-completion h3 { margin: 0 0 8px 0; font-size: 14px; color: #15803d; }
+        .flow-settle { background: #fefce8; border: 1px solid #fde68a; }
+        .flow-settle h3 { margin: 0 0 8px 0; font-size: 14px; color: #92400e; }
+        .gallery-section-label { font-size: 12px; color: #6b7280; font-weight: 600; margin: 8px 0 4px 0; }
         @media (max-width: 700px) {
             body { padding: 10px; }
             .container { max-width: 100%; }
@@ -4719,6 +5977,15 @@ TASK_DETAIL_HTML = '''
 </head>
 <body>
     <div class="container">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}
+            <div class="flash-messages">
+              {% for category, message in messages %}
+                <div class="alert-{{ category }}">{{ message }}</div>
+              {% endfor %}
+            </div>
+          {% endif %}
+        {% endwith %}
         <header>
             <div class="header-content">
                 <h1 style="margin:0;">工单详情 #{{ task.task_id }}</h1>
@@ -4737,29 +6004,215 @@ TASK_DETAIL_HTML = '''
                 {% if task.fault_phenomenon %}<div class="meta-item"><label>故障现象</label><span>{{ task.fault_phenomenon }}</span></div>{% endif %}
                 {% if task.resolution_method %}<div class="meta-item"><label>处理方式</label><span>{{ task.resolution_method }}</span></div>{% endif %}
                 <div class="meta-item"><label>客户地址</label><span>{{ task.customer_address or '—' }}</span></div>
-                <div class="meta-item"><label>截止日期</label><span>{{ task.due_date or '—' }}</span></div>
+                <div class="meta-item"><label>截止日期</label><span>{{ task.due_date or '—' }}{% if task.due_date and task.due_date < today and task.status not in ['已完成','已取消','已归档'] %} <span class="pill" style="background:#ffebe9;color:#cf222e;">已超时</span>{% endif %}</span></div>
                 <div class="meta-item"><label>执行人</label><span>{{ task.assigned_staff_name or '—' }}</span></div>
-                <div class="meta-item"><label>派单时间</label><span>{{ task.assigned_at or '—' }}</span></div>
+                <div class="meta-item"><label>派单时间</label><span>{{ task.assigned_at or '—' }}{% if task.assigned_at and not task.arrived_at and task.status in ['已派单','处理中'] and current_user and current_user.role_level >= 2 and sla_overdue %} <span class="pill" style="background:#fff4d6;color:#92400e;">未到达超时</span>{% endif %}</span></div>
                 <div class="meta-item"><label>创建/更新</label><span>{{ task.created_at or '—' }} / {{ task.updated_at or '—' }}</span></div>
             </div>
             {% if task.description %}
             <div class="desc-block">{{ task.description }}</div>
             {% endif %}
+
+            {% if task.source_report_id %}
+            <div style="margin:10px 0 0;padding:8px 12px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px;font-size:13px;color:#1e40af;">
+                来源：用户上报 #{{ task.source_report_id }}
+            </div>
+            {% endif %}
+            <div class="helper-box">
+                <h3>工单援助</h3>
+                {% set hs = task.helper_status %}
+                {% set helper_name = task.helper_staff_name or '—' %}
+
+                {% if hs == 'accepted' %}
+                    {# 已接受 #}
+                    <p style="margin:0 0 4px 0;font-size:14px;">援助人：<strong>{{ helper_name }}</strong> <span style="color:#15803d;">（已接受）</span></p>
+                    {% if is_helper %}<p style="margin:4px 0 0 0;font-size:13px;color:#15803d;">您是本工单的援助人。</p>{% endif %}
+
+                {% elif hs == 'pending' %}
+                    {# 管理员已批准，等待援助人确认 #}
+                    {% if is_assignee %}
+                        <p style="margin:0;font-size:14px;color:#92400e;">管理员已批准，等待 <strong>{{ helper_name }}</strong> 确认援助申请…</p>
+                    {% elif current_user and current_user.staff_id == task.helper_staff_id %}
+                        <p style="margin:0 0 10px 0;font-size:14px;"><strong>{{ task.assigned_staff_name or '执行人' }}</strong> 邀请您协助处理此工单，请确认：</p>
+                        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                        <form method="post" action="{{ url_for('respond_help', task_id=task.task_id) }}">
+                            <input type="hidden" name="action" value="accept">
+                            <button type="submit" class="btn btn-success btn-sm">接受援助</button>
+                        </form>
+                        <form method="post" action="{{ url_for('respond_help', task_id=task.task_id) }}">
+                            <input type="hidden" name="action" value="reject">
+                            <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('确认拒绝援助申请？')">拒绝</button>
+                        </form>
+                        </div>
+                    {% else %}
+                        <p style="margin:0;font-size:14px;color:#6b7280;">援助申请已批准，等待援助人确认中。</p>
+                    {% endif %}
+
+                {% elif hs == 'admin_pending' %}
+                    {# 等待管理员审核 #}
+                    {% if is_assignee %}
+                        <p style="margin:0 0 6px 0;font-size:14px;color:#92400e;">援助申请已提交，等待管理员审核（被邀请人：<strong>{{ helper_name }}</strong>）</p>
+                    {% endif %}
+                    {% if current_user and current_user.role_level >= 2 %}
+                        <p style="margin:0 0 8px 0;font-size:13px;color:#374151;">执行人 <strong>{{ task.assigned_staff_name or '—' }}</strong> 申请邀请 <strong>{{ helper_name }}</strong> 援助此工单，请审核：</p>
+                        <form method="post" action="{{ url_for('review_help', task_id=task.task_id) }}" style="display:flex;flex-direction:column;gap:8px;max-width:400px;">
+                            <textarea name="note" placeholder="审核备注（可选）" style="padding:6px 8px;border:1px solid #d1d5db;border-radius:4px;font-size:13px;min-height:50px;resize:vertical;"></textarea>
+                            <div style="display:flex;gap:8px;">
+                                <button type="submit" name="action" value="approve" class="btn btn-success btn-sm">批准</button>
+                                <button type="submit" name="action" value="reject" class="btn btn-danger btn-sm" onclick="return confirm('确认拒绝该援助申请？')">拒绝</button>
+                            </div>
+                        </form>
+                    {% elif not is_assignee %}
+                        <p style="margin:0;font-size:14px;color:#6b7280;">援助申请审核中。</p>
+                    {% endif %}
+
+                {% elif hs == 'admin_rejected' %}
+                    {# 管理员拒绝 #}
+                    <p style="margin:0 0 6px 0;font-size:14px;color:#b91c1c;">管理员已拒绝援助申请。{% if task.helper_admin_note %} 备注：{{ task.helper_admin_note }}{% endif %}</p>
+                    {% if is_assignee and task.status not in ['已完成', '已取消'] %}
+                    <p style="margin:4px 0 8px 0;font-size:13px;color:#6b7280;">可重新发起援助申请：</p>
+                    <form method="post" action="{{ url_for('request_help', task_id=task.task_id) }}" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                        <select name="helper_staff_id" required style="padding:6px 10px;border:1px solid #d1d5db;border-radius:4px;font-size:14px;">
+                            <option value="">— 选择援助人员 —</option>
+                            {% for s in staff_options %}<option value="{{ s.staff_id }}">{{ s.full_name }}</option>{% endfor %}
+                        </select>
+                        <button type="submit" class="btn btn-primary btn-sm">重新申请援助</button>
+                    </form>
+                    {% endif %}
+
+                {% elif hs == 'rejected' %}
+                    {# 援助人拒绝 #}
+                    <p style="margin:0 0 6px 0;font-size:14px;color:#b91c1c;">援助人已拒绝。</p>
+                    {% if is_assignee and task.status not in ['已完成', '已取消'] %}
+                    <p style="margin:4px 0 8px 0;font-size:13px;color:#6b7280;">可重新发起援助申请：</p>
+                    <form method="post" action="{{ url_for('request_help', task_id=task.task_id) }}" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                        <select name="helper_staff_id" required style="padding:6px 10px;border:1px solid #d1d5db;border-radius:4px;font-size:14px;">
+                            <option value="">— 选择援助人员 —</option>
+                            {% for s in staff_options %}<option value="{{ s.staff_id }}">{{ s.full_name }}</option>{% endfor %}
+                        </select>
+                        <button type="submit" class="btn btn-primary btn-sm">重新申请援助</button>
+                    </form>
+                    {% endif %}
+
+                {% elif is_assignee and task.status not in ['已完成', '已取消'] %}
+                    {# 无援助，执行人可申请 #}
+                    <p style="margin:0 0 8px 0;font-size:14px;color:#6b7280;">暂无援助人，如需帮助可申请援助（需管理员审核）。</p>
+                    <form method="post" action="{{ url_for('request_help', task_id=task.task_id) }}" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                        <select name="helper_staff_id" required style="padding:6px 10px;border:1px solid #d1d5db;border-radius:4px;font-size:14px;">
+                            <option value="">— 选择援助人员 —</option>
+                            {% for s in staff_options %}<option value="{{ s.staff_id }}">{{ s.full_name }}</option>{% endfor %}
+                        </select>
+                        <button type="submit" class="btn btn-primary btn-sm">发送援助申请</button>
+                    </form>
+
+                {% else %}
+                    <p style="margin:0;font-size:14px;color:#6b7280;">暂无援助人</p>
+                {% endif %}
+            </div>
         </div>
 
         <div class="card">
-            <h2 style="margin-top:0;">现场照片</h2>
-            <p style="color:#6b7280;font-size:14px;margin:0 0 8px 0;">支持 jpg/png/gif/webp，单张 ≤ 5MB，每单最多 {{ max_photos }} 张。选择本地图片后点击上传，将以 FormData 提交至服务器。</p>
-            <div id="imageGallery" class="gallery"></div>
-            <p id="galleryEmpty" class="empty-hint" style="display:none;">暂无照片，请在下方上传。</p>
+            <h2 style="margin-top:0;">工单进度</h2>
 
-            <div class="upload-box">
+            <!-- 已派单：工程师确认到达 -->
+            {% if task.status == '已派单' and can_operate %}
+            <div class="flow-section flow-arrival">
+                <h3>确认到达现场</h3>
+                <p style="color:#6b7280;font-size:13px;margin:0 0 10px 0;">请上传到达现场的照片作为凭证，上传后工单将进入「处理中」状态。</p>
+                <input type="file" id="arrivalInput" accept="image/jpeg,image/png,image/gif,image/webp" multiple>
+                <div style="margin-top:10px;display:flex;gap:10px;flex-wrap:wrap;">
+                    <button type="button" id="btnArrival" class="btn btn-primary">确认到达并上传照片</button>
+                </div>
+                <div id="arrivalStatus" class="upload-status"></div>
+            </div>
+            {% endif %}
+
+            <!-- 处理中：工程师确认完成 -->
+            {% if task.status == '处理中' and can_operate %}
+            {% if task.arrived_at %}
+            <p style="font-size:13px;color:#6b7280;margin:0 0 12px 0;">到达时间：{{ task.arrived_at }}</p>
+            {% endif %}
+            <div class="flow-section flow-completion">
+                <h3>确认完成任务</h3>
+                <p style="color:#6b7280;font-size:13px;margin:0 0 10px 0;">请上传完成任务的凭证照片，上传后工单将进入「待回执」状态等待管理员确认完成。</p>
+                <input type="file" id="completionInput" accept="image/jpeg,image/png,image/gif,image/webp" multiple>
+                <div style="margin-top:10px;display:flex;gap:10px;flex-wrap:wrap;">
+                    <button type="button" id="btnCompletion" class="btn btn-success">确认完成并上传凭证</button>
+                </div>
+                <div id="completionStatus" class="upload-status"></div>
+            </div>
+            <div class="flow-section" style="border-color:#f59e0b;margin-top:12px;">
+                <h3 style="color:#92400e;">挂起工单</h3>
+                <p style="color:#6b7280;font-size:13px;margin:0 0 10px 0;">如遇不可抗力或需等待条件，可挂起工单并填写原因。</p>
+                <form method="post" action="{{ url_for('suspend_task', task_id=task.task_id) }}">
+                    <textarea name="reason" placeholder="挂起原因（必填）" required style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #d1d5db;border-radius:4px;font-size:13px;min-height:60px;resize:vertical;margin-bottom:10px;"></textarea>
+                    <button type="submit" class="btn" style="background:#f59e0b;color:#fff;" onclick="return confirm('确认挂起该工单？')">挂起工单</button>
+                </form>
+            </div>
+            {% endif %}
+
+            <!-- 已挂起：显示挂起信息 + 恢复按钮 -->
+            {% if task.status == '已挂起' %}
+            <div class="flow-section" style="border-color:#f59e0b;">
+                <h3 style="color:#92400e;">工单已挂起</h3>
+                {% if task.suspended_at %}<p style="font-size:13px;color:#6b7280;margin:0 0 4px 0;">挂起时间：{{ task.suspended_at }}</p>{% endif %}
+                {% if task.suspend_reason %}<p style="font-size:13px;color:#6b7280;margin:0 0 10px 0;">挂起原因：{{ task.suspend_reason }}</p>{% endif %}
+                {% if can_operate or (current_user and current_user.role_level >= 2) %}
+                <form method="post" action="{{ url_for('resume_task', task_id=task.task_id) }}">
+                    <button type="submit" class="btn btn-primary" onclick="return confirm('确认恢复该工单？')">恢复处理</button>
+                </form>
+                {% endif %}
+            </div>
+            {% endif %}
+
+            <!-- 待回执：管理员确认完成 -->
+            {% if task.status == '待回执' %}
+            {% if task.arrived_at %}<p style="font-size:13px;color:#6b7280;margin:0 0 4px 0;">到达时间：{{ task.arrived_at }}</p>{% endif %}
+            {% if task.completed_at %}<p style="font-size:13px;color:#6b7280;margin:0 0 12px 0;">完成时间：{{ task.completed_at }}</p>{% endif %}
+            {% if current_user and current_user.role_level >= 2 %}
+            <div class="flow-section flow-settle">
+                <h3>确认完成</h3>
+                <p style="color:#6b7280;font-size:13px;margin:0 0 10px 0;">工程师已完成任务并上传凭证，请审核后确认完成。</p>
+                <form method="post" action="{{ url_for('settle_task', task_id=task.task_id) }}">
+                    <textarea name="notes" placeholder="备注（可选）" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #d1d5db;border-radius:4px;font-size:13px;min-height:60px;resize:vertical;margin-bottom:10px;"></textarea>
+                    <button type="submit" class="btn btn-success" onclick="return confirm('确认完成该工单？')">确认完成</button>
+                </form>
+            </div>
+            {% else %}
+            <p style="color:#92400e;font-size:14px;">工单已完成，等待管理员确认完成。</p>
+            {% endif %}
+            {% endif %}
+
+            <!-- 已完成：显示完成信息 -->
+            {% if task.status == '已完成' %}
+            <div style="font-size:13px;color:#6b7280;line-height:1.8;">
+                {% if task.arrived_at %}<div>到达时间：{{ task.arrived_at }}</div>{% endif %}
+                {% if task.completed_at %}<div>完成时间：{{ task.completed_at }}</div>{% endif %}
+                {% if task.settled_at %}<div>完成时间：{{ task.settled_at }}（{{ task.settler_name or '—' }}）</div>{% endif %}
+            </div>
+            {% endif %}
+
+            <!-- 照片展示区 -->
+            <div style="margin-top:16px;">
+                <div id="arrivalGallery" class="gallery" data-type="arrival"></div>
+                <div id="completionGallery" class="gallery" data-type="completion" style="margin-top:12px;"></div>
+                <div id="generalGallery" class="gallery" data-type="general" style="margin-top:12px;"></div>
+            </div>
+            <p id="galleryEmpty" class="empty-hint" style="display:none;">暂无照片。</p>
+
+            <!-- 通用照片上传（仅 can_operate） -->
+            {% if can_operate and task.status not in ['待派单', '已派单', '已完成', '已取消'] %}
+            <div class="upload-box" style="margin-top:12px;">
+                <p style="margin:0 0 8px 0;font-size:13px;color:#6b7280;">其他照片（可选）</p>
                 <input type="file" id="photoInput" accept="image/jpeg,image/png,image/gif,image/webp" multiple>
-                <div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap;">
-                    <button type="button" id="btnUpload" class="btn btn-success">上传选中图片</button>
-                    <button type="button" id="btnRefresh" class="btn btn-light">刷新列表</button>
+                <div style="margin-top:10px;display:flex;gap:10px;flex-wrap:wrap;">
+                    <button type="button" id="btnUpload" class="btn btn-light">上传其他照片</button>
                 </div>
                 <div id="uploadStatus" class="upload-status"></div>
+            </div>
+            {% endif %}
+            <div style="margin-top:10px;">
+                <button type="button" id="btnRefresh" class="btn btn-light">刷新照片</button>
             </div>
         </div>
     </div>
@@ -4767,115 +6220,117 @@ TASK_DETAIL_HTML = '''
     (function() {
         const taskId = {{ task.task_id }};
         const maxPhotos = {{ max_photos }};
-        const galleryEl = document.getElementById('imageGallery');
         const emptyEl = document.getElementById('galleryEmpty');
-        const statusEl = document.getElementById('uploadStatus');
         const initialImages = {{ images | tojson }};
 
-        function setStatus(text, type) {
-            statusEl.textContent = text || '';
-            statusEl.className = 'upload-status' + (type ? ' ' + type : '');
+        const TYPE_LABELS = { arrival: '到达照片', completion: '完成凭证', general: '其他照片' };
+
+        function makeGalleryItem(img) {
+            const wrap = document.createElement('div');
+            wrap.className = 'gallery-item';
+            wrap.dataset.id = img.image_id;
+            const link = document.createElement('a');
+            link.href = img.url; link.target = '_blank'; link.rel = 'noopener';
+            const image = document.createElement('img');
+            image.src = img.url; image.alt = img.original_filename || '照片';
+            link.appendChild(image);
+            const cap = document.createElement('div');
+            cap.style.cssText = 'font-size:12px;color:#6b7280;';
+            cap.textContent = img.created_at || '';
+            const del = document.createElement('button');
+            del.type = 'button'; del.className = 'btn btn-danger btn-sm';
+            del.style.marginTop = '6px'; del.textContent = '删除';
+            del.addEventListener('click', function() { deleteImage(img.image_id); });
+            wrap.appendChild(link); wrap.appendChild(cap); wrap.appendChild(del);
+            return wrap;
         }
 
-        function renderGallery(images) {
-            galleryEl.innerHTML = '';
-            if (!images || !images.length) {
-                emptyEl.style.display = 'block';
-                return;
-            }
-            emptyEl.style.display = 'none';
-            images.forEach(function(img) {
-                const wrap = document.createElement('div');
-                wrap.className = 'gallery-item';
-                wrap.dataset.id = img.image_id;
-                const link = document.createElement('a');
-                link.href = img.url;
-                link.target = '_blank';
-                link.rel = 'noopener';
-                const image = document.createElement('img');
-                image.src = img.url;
-                image.alt = img.original_filename || '现场照片';
-                link.appendChild(image);
-                const cap = document.createElement('div');
-                cap.style.fontSize = '12px';
-                cap.style.color = '#6b7280';
-                cap.textContent = img.created_at || '';
-                const del = document.createElement('button');
-                del.type = 'button';
-                del.className = 'btn btn-danger btn-sm';
-                del.style.marginTop = '6px';
-                del.textContent = '删除';
-                del.addEventListener('click', function() { deleteImage(img.image_id); });
-                wrap.appendChild(link);
-                wrap.appendChild(cap);
-                wrap.appendChild(del);
-                galleryEl.appendChild(wrap);
+        function renderGalleries(images) {
+            const byType = { arrival: [], completion: [], general: [] };
+            (images || []).forEach(function(img) {
+                const t = img.image_type || 'general';
+                if (!byType[t]) byType[t] = [];
+                byType[t].push(img);
             });
+            let total = 0;
+            ['arrival', 'completion', 'general'].forEach(function(t) {
+                const el = document.getElementById(t + 'Gallery');
+                if (!el) return;
+                el.innerHTML = '';
+                const items = byType[t] || [];
+                total += items.length;
+                if (items.length) {
+                    const lbl = document.createElement('p');
+                    lbl.className = 'gallery-section-label';
+                    lbl.textContent = TYPE_LABELS[t] + '（' + items.length + '张）';
+                    el.appendChild(lbl);
+                    items.forEach(function(img) { el.appendChild(makeGalleryItem(img)); });
+                }
+            });
+            emptyEl.style.display = total === 0 ? 'block' : 'none';
+        }
+
+        function setStatus(elId, text, type) {
+            const el = document.getElementById(elId);
+            if (!el) return;
+            el.textContent = text || '';
+            el.className = 'upload-status' + (type ? ' ' + type : '');
+        }
+
+        async function uploadWithType(inputId, btnId, statusId, imageType) {
+            const input = document.getElementById(inputId);
+            if (!input || !input.files || !input.files.length) {
+                setStatus(statusId, '请先选择图片文件', 'error'); return;
+            }
+            const fd = new FormData();
+            for (let i = 0; i < input.files.length; i++) fd.append('photos', input.files[i]);
+            fd.append('image_type', imageType);
+            setStatus(statusId, '上传中…', '');
+            const btn = document.getElementById(btnId);
+            if (btn) btn.disabled = true;
+            try {
+                const res = await fetch('/api/task/' + taskId + '/images', { method: 'POST', body: fd });
+                const data = await res.json();
+                if (!data.ok) { setStatus(statusId, data.message || '上传失败', 'error'); return; }
+                renderGalleries(data.images);
+                input.value = '';
+                setStatus(statusId, data.message || '上传成功', 'ok');
+                if (imageType === 'arrival' || imageType === 'completion') {
+                    setTimeout(function() { location.reload(); }, 1200);
+                }
+            } catch (e) {
+                setStatus(statusId, '网络错误：' + e, 'error');
+            } finally {
+                if (btn) btn.disabled = false;
+            }
         }
 
         async function loadImages() {
             const res = await fetch('/api/task/' + taskId + '/images');
             const data = await res.json();
-            if (!data.ok) {
-                setStatus(data.message || '加载失败', 'error');
-                return;
-            }
-            renderGallery(data.images);
-            setStatus('共 ' + (data.images ? data.images.length : 0) + ' 张 / 最多 ' + maxPhotos + ' 张', '');
-        }
-
-        async function uploadPhotos() {
-            const input = document.getElementById('photoInput');
-            if (!input.files || !input.files.length) {
-                setStatus('请先选择图片文件', 'error');
-                return;
-            }
-            const fd = new FormData();
-            for (let i = 0; i < input.files.length; i++) {
-                fd.append('photos', input.files[i]);
-            }
-            setStatus('上传中…', '');
-            document.getElementById('btnUpload').disabled = true;
-            try {
-                const res = await fetch('/api/task/' + taskId + '/images', { method: 'POST', body: fd });
-                const data = await res.json();
-                if (!data.ok) {
-                    setStatus(data.message || '上传失败', 'error');
-                    return;
-                }
-                renderGallery(data.images);
-                input.value = '';
-                setStatus(data.message || '上传成功', 'ok');
-            } catch (e) {
-                setStatus('网络错误：' + e, 'error');
-            } finally {
-                document.getElementById('btnUpload').disabled = false;
-            }
+            if (!data.ok) return;
+            renderGalleries(data.images);
         }
 
         async function deleteImage(imageId) {
             if (!confirm('确定删除这张照片？')) return;
-            setStatus('删除中…', '');
             try {
                 const res = await fetch('/api/task/' + taskId + '/images/' + imageId, { method: 'DELETE' });
                 const data = await res.json();
-                if (!data.ok) {
-                    setStatus(data.message || '删除失败', 'error');
-                    return;
-                }
-                renderGallery(data.images);
-                setStatus('已删除', 'ok');
-            } catch (e) {
-                setStatus('网络错误：' + e, 'error');
-            }
+                if (data.ok) renderGalleries(data.images);
+            } catch (e) {}
         }
 
-        document.getElementById('btnUpload').addEventListener('click', uploadPhotos);
         document.getElementById('btnRefresh').addEventListener('click', loadImages);
-        renderGallery(initialImages);
-        if (initialImages && initialImages.length) {
-            setStatus('共 ' + initialImages.length + ' 张 / 最多 ' + maxPhotos + ' 张', '');
-        }
+        {% if can_operate %}
+        const btnArrival = document.getElementById('btnArrival');
+        if (btnArrival) btnArrival.addEventListener('click', function() { uploadWithType('arrivalInput', 'btnArrival', 'arrivalStatus', 'arrival'); });
+        const btnCompletion = document.getElementById('btnCompletion');
+        if (btnCompletion) btnCompletion.addEventListener('click', function() { uploadWithType('completionInput', 'btnCompletion', 'completionStatus', 'completion'); });
+        const btnUpload = document.getElementById('btnUpload');
+        if (btnUpload) btnUpload.addEventListener('click', function() { uploadWithType('photoInput', 'btnUpload', 'uploadStatus', 'general'); });
+        {% endif %}
+        renderGalleries(initialImages);
     })();
     </script>
 </body>
@@ -4920,14 +6375,14 @@ ADD_TASK_HTML = '''
             <form method="post">
                 <div class="form-group">
                     <label for="title">任务标题 <span class="required-mark">*</span></label>
-                    <input type="text" id="title" name="title" required maxlength="200">
+                    <input type="text" id="title" name="title" required maxlength="200" value="{{ prefill.title if prefill else '' }}">
                 </div>
                 <div class="form-group">
                     <label for="fault_type">业务类型</label>
                     <select id="fault_type" name="fault_type" onchange="onBizTypeChange(this.value)">
                         <option value="">请选择</option>
                         {% for ft in fault_business_types %}
-                        <option value="{{ ft }}">{{ ft }}</option>
+                        <option value="{{ ft }}" {% if prefill and prefill.fault_type == ft %}selected{% endif %}>{{ ft }}</option>
                         {% endfor %}
                     </select>
                 </div>
@@ -4957,18 +6412,25 @@ ADD_TASK_HTML = '''
                 }
                 </script>
                 <div class="form-group">
-                    <label for="customer_address">客户地址</label>
-                    <div style="display:flex;gap:8px;align-items:center;">
-                        <input type="text" id="customer_address" name="customer_address" maxlength="500" placeholder="客户详细地址" style="flex:1;">
+                    <label>客户地址</label>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
+                        <select id="task_province" onchange="onTaskProvinceChange()" style="flex:1;min-width:120px;">
+                            <option value="">选择省份</option>
+                        </select>
+                        <select id="task_city" onchange="onTaskCityChange()" style="flex:1;min-width:120px;">
+                            <option value="">选择城市</option>
+                        </select>
                         <button type="button" class="btn btn-primary" style="white-space:nowrap;" onclick="getTaskLocation()">📍 获取位置</button>
                     </div>
+                    <input type="text" id="task_detail" name="task_detail" maxlength="300" placeholder="详细地址（街道、门牌号等）" style="width:100%;box-sizing:border-box;" value="{{ prefill.customer_address if prefill else '' }}">
+                    <input type="hidden" id="customer_address" name="customer_address" value="{{ prefill.customer_address if prefill else '' }}">
                     <input type="hidden" id="task_lat" name="task_lat">
                     <input type="hidden" id="task_lng" name="task_lng">
                     <small id="loc-status" style="color:#6b7280;font-size:12px;"></small>
                 </div>
                 <div class="form-group">
                     <label for="description">任务说明</label>
-                    <textarea id="description" name="description" placeholder="可选：具体要求、客户信息等"></textarea>
+                    <textarea id="description" name="description" placeholder="可选：具体要求、客户信息等">{% if prefill and (prefill.contact_name or prefill.contact_phone) %}联系人：{{ prefill.contact_name }}  电话：{{ prefill.contact_phone }}{% endif %}</textarea>
                 </div>
                 <div class="form-group">
                     <label for="priority">优先级</label>
@@ -4983,6 +6445,8 @@ ADD_TASK_HTML = '''
                     <input type="date" id="due_date" name="due_date">
                 </div>
                 <div class="form-actions">
+                    <input type="hidden" name="source_report_id" value="{{ prefill.source_report_id if prefill else '' }}">
+                    <input type="hidden" name="reporter_user_id" value="{{ prefill.reporter_user_id if prefill else '' }}">
                     <button type="submit" class="btn btn-success">保存</button>
                     <a href="{{ url_for('tasks_page') }}" class="btn btn-danger">取消</a>
                 </div>
@@ -4990,17 +6454,88 @@ ADD_TASK_HTML = '''
         </div>
     </div>
 <script>
+var PC_TASK = {
+"北京":["东城","西城","朝阳","丰台","石景山","海淀","门头沟","房山","通州","顺义","昌平","大兴","怀柔","平谷","密云","延庆"],
+"天津":["和平","河东","河西","南开","河北","红桥","东丽","西青","津南","北辰","武清","宝坻","滨海新区","宁河","静海","蓟州"],
+"河北":["石家庄","唐山","秦皇岛","邯郸","邢台","保定","张家口","承德","沧州","廊坊","衡水"],
+"山西":["太原","大同","阳泉","长治","晋城","朔州","晋中","运城","忻州","临汾","吕梁"],
+"内蒙古":["呼和浩特","包头","乌海","赤峰","通辽","鄂尔多斯","呼伦贝尔","巴彦淖尔","乌兰察布","兴安盟","锡林郭勒盟","阿拉善盟"],
+"辽宁":["沈阳","大连","鞍山","抚顺","本溪","丹东","锦州","营口","阜新","辽阳","盘锦","铁岭","朝阳","葫芦岛"],
+"吉林":["长春","吉林","四平","辽源","通化","白山","松原","白城","延边"],
+"黑龙江":["哈尔滨","齐齐哈尔","鸡西","鹤岗","双鸭山","大庆","伊春","佳木斯","七台河","牡丹江","黑河","绥化","大兴安岭"],
+"上海":["黄浦","徐汇","长宁","静安","普陀","虹口","杨浦","闵行","宝山","嘉定","浦东新区","金山","松江","青浦","奉贤","崇明"],
+"江苏":["南京","无锡","徐州","常州","苏州","南通","连云港","淮安","盐城","扬州","镇江","泰州","宿迁"],
+"浙江":["杭州","宁波","温州","嘉兴","湖州","绍兴","金华","衢州","舟山","台州","丽水"],
+"安徽":["合肥","芜湖","蚌埠","淮南","马鞍山","淮北","铜陵","安庆","黄山","滁州","阜阳","宿州","六安","亳州","池州","宣城"],
+"福建":["福州","厦门","莆田","三明","泉州","漳州","南平","龙岩","宁德"],
+"江西":["南昌","景德镇","萍乡","九江","新余","鹰潭","赣州","吉安","宜春","抚州","上饶"],
+"山东":["济南","青岛","淄博","枣庄","东营","烟台","潍坊","济宁","泰安","威海","日照","临沂","德州","聊城","滨州","菏泽"],
+"河南":["郑州","开封","洛阳","平顶山","安阳","鹤壁","新乡","焦作","濮阳","许昌","漯河","三门峡","南阳","商丘","信阳","周口","驻马店"],
+"湖北":["武汉","黄石","十堰","宜昌","襄阳","鄂州","荆门","孝感","荆州","黄冈","咸宁","随州","恩施","仙桃","潜江","天门","神农架"],
+"湖南":["长沙","株洲","湘潭","衡阳","邵阳","岳阳","常德","张家界","益阳","郴州","永州","怀化","娄底","湘西"],
+"广东":["广州","深圳","珠海","汕头","佛山","韶关","湛江","肇庆","江门","茂名","惠州","梅州","汕尾","河源","阳江","清远","东莞","中山","潮州","揭州","云浮"],
+"广西":["南宁","柳州","桂林","梧州","北海","防城港","钦州","贵港","玉林","百色","贺州","河池","来宾","崇左"],
+"海南":["海口","三亚","三沙","儋州","五指山","琼海","文昌","万宁","东方","定安","屯昌","澄迈","临高","白沙","昌江","乐东","陵水","保亭","琼中"],
+"重庆":["万州","涪陵","渝中","大渡口","江北","沙坪坝","九龙坡","南岸","北碚","綦江","大足","渝北","巴南","黔江","长寿","江津","合川","永川","南川","璧山","铜梁","潼南","荣昌","开州","梁平","武隆","城口","丰都","垫江","忠县","云阳","奉节","巫山","巫溪","石柱","秀山","酉阳","彭水"],
+"四川":["成都","自贡","攀枝花","泸州","德阳","绵阳","广元","遂宁","内江","乐山","南充","眉山","宜宾","广安","达州","雅安","巴中","资阳","阿坝","甘孜","凉山"],
+"贵州":["贵阳","六盘水","遵义","安顺","毕节","铜仁","黔西南","黔东南","黔南"],
+"云南":["昆明","曲靖","玉溪","保山","昭通","丽江","普洱","临沧","楚雄","红河","文山","西双版纳","大理","德宏","怒江","迪庆"],
+"西藏":["拉萨","日喀则","昌都","林芝","山南","那曲","阿里"],
+"陕西":["西安","铜川","宝鸡","咸阳","渭南","延安","汉中","榆林","安康","商洛"],
+"甘肃":["兰州","嘉峪关","金昌","白银","天水","武威","张掖","平凉","酒泉","庆阳","定西","陇南","临夏","甘南"],
+"青海":["西宁","海东","海北","黄南","海南","果洛","玉树","海西"],
+"宁夏":["银川","石嘴山","吴忠","固原","中卫"],
+"新疆":["乌鲁木齐","克拉玛依","吐鲁番","哈密","昌吉","博尔塔拉","巴音郭楞","阿克苏","克孜勒苏","喀什","和田","伊犁","塔城","阿勒泰","石河子","阿拉尔","图木舒克","五家渠","北屯","铁门关","双河","可克达拉","昆玉","胡杨河"]
+};
+function onTaskProvinceChange() {
+    var pSel = document.getElementById('task_province');
+    var cSel = document.getElementById('task_city');
+    var prov = pSel.value;
+    cSel.innerHTML = '<option value="">选择城市</option>';
+    if (prov && PC_TASK[prov]) {
+        PC_TASK[prov].forEach(function(c) {
+            var o = document.createElement('option');
+            o.value = c; o.textContent = c;
+            cSel.appendChild(o);
+        });
+    }
+    updateTaskAddress();
+}
+function onTaskCityChange() { updateTaskAddress(); }
+function updateTaskAddress() {
+    var prov = document.getElementById('task_province').value;
+    var city = document.getElementById('task_city').value;
+    var detail = document.getElementById('task_detail').value;
+    document.getElementById('customer_address').value = (prov || '') + (city || '') + (detail || '');
+}
+document.addEventListener('DOMContentLoaded', function() {
+    var pSel = document.getElementById('task_province');
+    Object.keys(PC_TASK).forEach(function(p) {
+        var o = document.createElement('option');
+        o.value = p; o.textContent = p;
+        pSel.appendChild(o);
+    });
+    document.getElementById('task_detail').addEventListener('input', updateTaskAddress);
+});
 function getTaskLocation() {
     var status = document.getElementById('loc-status');
-    if (!navigator.geolocation) { status.textContent = '浏览器不支持定位'; return; }
     status.textContent = '定位中...';
-    navigator.geolocation.getCurrentPosition(function(pos) {
-        document.getElementById('task_lat').value = pos.coords.latitude;
-        document.getElementById('task_lng').value = pos.coords.longitude;
-        status.textContent = '已获取位置（' + pos.coords.latitude.toFixed(4) + ', ' + pos.coords.longitude.toFixed(4) + '）';
+    status.style.color = '#6b7280';
+    fetch('/api/ip_location').then(function(r){ return r.json(); }).then(function(d) {
+        if (!d.ok) throw new Error(d.message || '定位失败');
+        var prov = d.province || '';
+        var city = d.city || '';
+        var pSel = document.getElementById('task_province');
+        if (prov) {
+            pSel.value = prov;
+            onTaskProvinceChange();
+            if (city) document.getElementById('task_city').value = city;
+            updateTaskAddress();
+        }
+        status.textContent = '已获取位置：' + prov + city;
         status.style.color = '#15803d';
-    }, function(err) {
-        status.textContent = '定位失败：' + err.message;
+    }).catch(function(e) {
+        status.textContent = '定位失败：' + e.message;
         status.style.color = '#b91c1c';
     });
 }
@@ -5085,8 +6620,17 @@ EDIT_TASK_HTML = '''
                 (function(){ onBizTypeChange({{ task.fault_type | tojson }}); })();
                 </script>
                 <div class="form-group">
-                    <label for="customer_address">客户地址</label>
-                    <input type="text" id="customer_address" name="customer_address" maxlength="500" value="{{ task.customer_address or '' }}">
+                    <label>客户地址</label>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
+                        <select id="task_province" onchange="onTaskProvinceChange()" style="flex:1;min-width:120px;">
+                            <option value="">选择省份</option>
+                        </select>
+                        <select id="task_city" onchange="onTaskCityChange()" style="flex:1;min-width:120px;">
+                            <option value="">选择城市</option>
+                        </select>
+                    </div>
+                    <input type="text" id="task_detail" name="task_detail" maxlength="300" placeholder="详细地址（街道、门牌号等）" style="width:100%;box-sizing:border-box;">
+                    <input type="hidden" id="customer_address" name="customer_address" value="{{ task.customer_address or '' }}">
                 </div>
                 <div class="form-group">
                     <label for="description">任务说明</label>
@@ -5119,6 +6663,87 @@ EDIT_TASK_HTML = '''
             </form>
         </div>
     </div>
+<script>
+var PC_ET = {
+"北京":["东城","西城","朝阳","丰台","石景山","海淀","门头沟","房山","通州","顺义","昌平","大兴","怀柔","平谷","密云","延庆"],
+"天津":["和平","河东","河西","南开","河北","红桥","东丽","西青","津南","北辰","武清","宝坻","滨海新区","宁河","静海","蓟州"],
+"河北":["石家庄","唐山","秦皇岛","邯郸","邢台","保定","张家口","承德","沧州","廊坊","衡水"],
+"山西":["太原","大同","阳泉","长治","晋城","朔州","晋中","运城","忻州","临汾","吕梁"],
+"内蒙古":["呼和浩特","包头","乌海","赤峰","通辽","鄂尔多斯","呼伦贝尔","巴彦淖尔","乌兰察布","兴安盟","锡林郭勒盟","阿拉善盟"],
+"辽宁":["沈阳","大连","鞍山","抚顺","本溪","丹东","锦州","营口","阜新","辽阳","盘锦","铁岭","朝阳","葫芦岛"],
+"吉林":["长春","吉林","四平","辽源","通化","白山","松原","白城","延边"],
+"黑龙江":["哈尔滨","齐齐哈尔","鸡西","鹤岗","双鸭山","大庆","伊春","佳木斯","七台河","牡丹江","黑河","绥化","大兴安岭"],
+"上海":["黄浦","徐汇","长宁","静安","普陀","虹口","杨浦","闵行","宝山","嘉定","浦东新区","金山","松江","青浦","奉贤","崇明"],
+"江苏":["南京","无锡","徐州","常州","苏州","南通","连云港","淮安","盐城","扬州","镇江","泰州","宿迁"],
+"浙江":["杭州","宁波","温州","嘉兴","湖州","绍兴","金华","衢州","舟山","台州","丽水"],
+"安徽":["合肥","芜湖","蚌埠","淮南","马鞍山","淮北","铜陵","安庆","黄山","滁州","阜阳","宿州","六安","亳州","池州","宣城"],
+"福建":["福州","厦门","莆田","三明","泉州","漳州","南平","龙岩","宁德"],
+"江西":["南昌","景德镇","萍乡","九江","新余","鹰潭","赣州","吉安","宜春","抚州","上饶"],
+"山东":["济南","青岛","淄博","枣庄","东营","烟台","潍坊","济宁","泰安","威海","日照","临沂","德州","聊城","滨州","菏泽"],
+"河南":["郑州","开封","洛阳","平顶山","安阳","鹤壁","新乡","焦作","濮阳","许昌","漯河","三门峡","南阳","商丘","信阳","周口","驻马店"],
+"湖北":["武汉","黄石","十堰","宜昌","襄阳","鄂州","荆门","孝感","荆州","黄冈","咸宁","随州","恩施","仙桃","潜江","天门","神农架"],
+"湖南":["长沙","株洲","湘潭","衡阳","邵阳","岳阳","常德","张家界","益阳","郴州","永州","怀化","娄底","湘西"],
+"广东":["广州","深圳","珠海","汕头","佛山","韶关","湛江","肇庆","江门","茂名","惠州","梅州","汕尾","河源","阳江","清远","东莞","中山","潮州","揭州","云浮"],
+"广西":["南宁","柳州","桂林","梧州","北海","防城港","钦州","贵港","玉林","百色","贺州","河池","来宾","崇左"],
+"海南":["海口","三亚","三沙","儋州","五指山","琼海","文昌","万宁","东方","定安","屯昌","澄迈","临高","白沙","昌江","乐东","陵水","保亭","琼中"],
+"重庆":["万州","涪陵","渝中","大渡口","江北","沙坪坝","九龙坡","南岸","北碚","綦江","大足","渝北","巴南","黔江","长寿","江津","合川","永川","南川","璧山","铜梁","潼南","荣昌","开州","梁平","武隆","城口","丰都","垫江","忠县","云阳","奉节","巫山","巫溪","石柱","秀山","酉阳","彭水"],
+"四川":["成都","自贡","攀枝花","泸州","德阳","绵阳","广元","遂宁","内江","乐山","南充","眉山","宜宾","广安","达州","雅安","巴中","资阳","阿坝","甘孜","凉山"],
+"贵州":["贵阳","六盘水","遵义","安顺","毕节","铜仁","黔西南","黔东南","黔南"],
+"云南":["昆明","曲靖","玉溪","保山","昭通","丽江","普洱","临沧","楚雄","红河","文山","西双版纳","大理","德宏","怒江","迪庆"],
+"西藏":["拉萨","日喀则","昌都","林芝","山南","那曲","阿里"],
+"陕西":["西安","铜川","宝鸡","咸阳","渭南","延安","汉中","榆林","安康","商洛"],
+"甘肃":["兰州","嘉峪关","金昌","白银","天水","武威","张掖","平凉","酒泉","庆阳","定西","陇南","临夏","甘南"],
+"青海":["西宁","海东","海北","黄南","海南","果洛","玉树","海西"],
+"宁夏":["银川","石嘴山","吴忠","固原","中卫"],
+"新疆":["乌鲁木齐","克拉玛依","吐鲁番","哈密","昌吉","博尔塔拉","巴音郭楞","阿克苏","克孜勒苏","喀什","和田","伊犁","塔城","阿勒泰","石河子","阿拉尔","图木舒克","五家渠","北屯","铁门关","双河","可克达拉","昆玉","胡杨河"]
+};
+function onTaskProvinceChange() {
+    var pSel = document.getElementById('task_province');
+    var cSel = document.getElementById('task_city');
+    cSel.innerHTML = '<option value="">选择城市</option>';
+    var prov = pSel.value;
+    if (prov && PC_ET[prov]) {
+        PC_ET[prov].forEach(function(ct) {
+            var o = document.createElement('option');
+            o.value = ct; o.textContent = ct; cSel.appendChild(o);
+        });
+    }
+    updateTaskAddress();
+}
+function onTaskCityChange() { updateTaskAddress(); }
+function updateTaskAddress() {
+    var prov = document.getElementById('task_province').value;
+    var city = document.getElementById('task_city').value;
+    var detail = document.getElementById('task_detail').value;
+    document.getElementById('customer_address').value = (prov||'') + (city||'') + (detail||'');
+}
+document.addEventListener('DOMContentLoaded', function() {
+    var pSel = document.getElementById('task_province');
+    Object.keys(PC_ET).forEach(function(p) {
+        var o = document.createElement('option');
+        o.value = p; o.textContent = p; pSel.appendChild(o);
+    });
+    var saved = document.getElementById('customer_address').value || '';
+    if (!saved) { document.getElementById('task_detail').addEventListener('input', updateTaskAddress); return; }
+    var matchedProv = '';
+    Object.keys(PC_ET).forEach(function(p) { if (saved.startsWith(p)) matchedProv = p; });
+    if (matchedProv) {
+        pSel.value = matchedProv;
+        onTaskProvinceChange();
+        var rest = saved.slice(matchedProv.length);
+        var matchedCity = '';
+        (PC_ET[matchedProv]||[]).forEach(function(ct) { if (rest.startsWith(ct)) matchedCity = ct; });
+        if (matchedCity) {
+            document.getElementById('task_city').value = matchedCity;
+            rest = rest.slice(matchedCity.length);
+        }
+        document.getElementById('task_detail').value = rest;
+    } else {
+        document.getElementById('task_detail').value = saved;
+    }
+    document.getElementById('task_detail').addEventListener('input', updateTaskAddress);
+});
+</script>
 </body>
 </html>
 '''
@@ -5189,4 +6814,7 @@ ASSIGN_TASK_HTML = '''
 '''
 
 if __name__ == '__main__':
+    scheduler = BackgroundScheduler(daemon=True)
+    scheduler.add_job(check_overdue_tasks, "interval", minutes=30, id="overdue_check")
+    scheduler.start()
     app.run(debug=True)
