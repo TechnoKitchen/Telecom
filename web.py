@@ -199,10 +199,12 @@ def inject_current_user():
 
 @app.before_request
 def require_login():
-    public_endpoints = {"login", "register", "static"}
+    public_endpoints = {"login", "register", "static", "user_login", "user_register", "user_index"}
     if request.endpoint is None:
         return None
     if request.endpoint in public_endpoints:
+        return None
+    if request.endpoint.startswith("user_"):
         return None
     if not is_logged_in():
         next_url = request.path
@@ -3911,6 +3913,8 @@ def issue_reports_admin():
     return render_template_string(ISSUE_REPORTS_ADMIN_HTML, reports=reports)
 
 
+_STAFF_SWITCH_BTN = '<a href="/user/" style="position:fixed;bottom:20px;right:20px;z-index:9999;background:#3b82f6;color:#fff;padding:8px 16px;border-radius:20px;font-size:13px;text-decoration:none;box-shadow:0 2px 8px rgba(0,0,0,0.25);">👤 用户端</a>'
+
 ISSUE_REPORTS_ADMIN_HTML = '''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -4062,6 +4066,7 @@ LOGIN_HTML = '''
             <p class="helper">没有账号？<a href="{{ url_for('register') }}">去注册</a></p>
         </div>
     </div>
+''' + _STAFF_SWITCH_BTN + '''
 </body>
 </html>
 '''
@@ -4407,8 +4412,6 @@ TASK_STATISTICS_HTML = '''
 '''
 
 # 任务管理页（与员工页通过顶部导航切换）
-_STAFF_SWITCH_BTN = '<a href="/user/" style="position:fixed;bottom:20px;right:20px;z-index:9999;background:#3b82f6;color:#fff;padding:8px 16px;border-radius:20px;font-size:13px;text-decoration:none;box-shadow:0 2px 8px rgba(0,0,0,0.25);">👤 用户端</a>'
-
 TASKS_PAGE_HTML = '''
 <!DOCTYPE html>
 <html lang="zh-CN">
