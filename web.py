@@ -13,7 +13,11 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 import cloudinary
 import cloudinary.uploader
-from apscheduler.schedulers.background import BackgroundScheduler
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    _APSCHEDULER_AVAILABLE = True
+except ImportError:
+    _APSCHEDULER_AVAILABLE = False
 import hashlib
 import secrets
 import urllib.request as _urlreq
@@ -7468,7 +7472,8 @@ def user_rate_task(task_id):
 
 
 if __name__ == '__main__':
-    scheduler = BackgroundScheduler(daemon=True)
-    scheduler.add_job(check_overdue_tasks, "interval", minutes=30, id="overdue_check")
-    scheduler.start()
+    if _APSCHEDULER_AVAILABLE:
+        scheduler = BackgroundScheduler(daemon=True)
+        scheduler.add_job(check_overdue_tasks, "interval", minutes=30, id="overdue_check")
+        scheduler.start()
     app.run(debug=True)
