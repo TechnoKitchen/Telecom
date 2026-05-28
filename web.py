@@ -29,12 +29,13 @@ app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'a_secret_key_for_flask_flash_messages')
 
 # 数据库配置（优先读取环境变量，本地开发回退到默认值）
+# 兼容 Railway MySQL 插件变量名（MYSQLHOST 等）和自定义变量名（DB_HOST 等）
 DB_CONFIG = {
-    "host": os.environ.get("DB_HOST", "127.0.0.1"),
-    "port": int(os.environ.get("DB_PORT", 3306)),
-    "user": os.environ.get("DB_USER", "root"),
-    "password": os.environ.get("DB_PASSWORD", "tlxsdy8823166"),
-    "database": os.environ.get("DB_NAME", "telecom_maintenance"),
+    "host": os.environ.get("DB_HOST") or os.environ.get("MYSQLHOST", "127.0.0.1"),
+    "port": int(os.environ.get("DB_PORT") or os.environ.get("MYSQLPORT", 3306)),
+    "user": os.environ.get("DB_USER") or os.environ.get("MYSQLUSER", "root"),
+    "password": os.environ.get("DB_PASSWORD") or os.environ.get("MYSQLPASSWORD", "tlxsdy8823166"),
+    "database": os.environ.get("DB_NAME") or os.environ.get("MYSQLDATABASE", "telecom_maintenance"),
     "charset": 'utf8mb4',
     "cursorclass": pymysql.cursors.DictCursor
 }
