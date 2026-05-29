@@ -1683,27 +1683,26 @@ def login():
             session["role_level"] = role_level
             staff_id_for_loc = user.get("staff_id")
             session["staff_id"] = staff_id_for_loc
-            # 登录定位暂时关闭（保留上次记录）
-            # if staff_id_for_loc:
-            #     try:
-            #         client_ip = request.headers.get("X-Forwarded-For", request.remote_addr) or ""
-            #         prov, ct = _ip_to_province_city(client_ip)
-            #         if prov or ct:
-            #             loc_conn = get_db_connection()
-            #             if loc_conn:
-            #                 try:
-            #                     loc_cur = loc_conn.cursor()
-            #                     loc_cur.execute(
-            #                         "UPDATE staff_basic_info SET location_province=%s, location_city=%s, location_updated_at=NOW() WHERE staff_id=%s",
-            #                         (prov, ct, staff_id_for_loc),
-            #                     )
-            #                     loc_conn.commit()
-            #                     loc_cur.close()
-            #                 finally:
-            #                     if loc_conn and getattr(loc_conn, "open", False):
-            #                         loc_conn.close()
-            #     except Exception:
-            #         pass
+            if staff_id_for_loc:
+                try:
+                    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr) or ""
+                    prov, ct = _ip_to_province_city(client_ip)
+                    if prov or ct:
+                        loc_conn = get_db_connection()
+                        if loc_conn:
+                            try:
+                                loc_cur = loc_conn.cursor()
+                                loc_cur.execute(
+                                    "UPDATE staff_basic_info SET location_province=%s, location_city=%s, location_updated_at=NOW() WHERE staff_id=%s",
+                                    (prov, ct, staff_id_for_loc),
+                                )
+                                loc_conn.commit()
+                                loc_cur.close()
+                            finally:
+                                if loc_conn and getattr(loc_conn, "open", False):
+                                    loc_conn.close()
+                except Exception:
+                    pass
             flash(f"欢迎回来，{display_name}", "success")
             # 检查是否有待确认的援助工单
             try:
@@ -3977,7 +3976,7 @@ ISSUE_REPORTS_ADMIN_HTML = '''<!DOCTYPE html>
         {% if reports %}
         <table>
             <thead><tr>
-                <th>编号</th><th>用户</th><th>联系人</th><th>业务类型</th><th>标题</th><th>上报时间</th><th>状态</th><th>操作</th>
+                <th>编号</th><th>用户</th><th>联系人</th><th>业务类型</th><th>标题</th><th>上报时间</th><th>来源地</th><th>状态</th><th>操作</th>
             </tr></thead>
             <tbody>
             {% for r in reports %}
@@ -3988,6 +3987,9 @@ ISSUE_REPORTS_ADMIN_HTML = '''<!DOCTYPE html>
                 <td>{{ r.fault_type or '—' }}</td>
                 <td>{{ r.title }}</td>
                 <td style="white-space:nowrap;">{{ r.created_at.strftime('%Y-%m-%d %H:%M') if r.created_at else '—' }}</td>
+                <td style="white-space:nowrap;font-size:13px;">
+                    {% if r.reporter_province or r.reporter_city %}{{ r.reporter_province or '' }}{{ r.reporter_city or '' }}{% else %}—{% endif %}
+                </td>
                 <td>
                     {% if r.display_status == 'pending' %}<span class="pill pill-pending">待处理</span>
                     {% elif r.display_status in ('已派单', '处理中', '待回执') %}<span class="pill pill-processing">{{ r.display_status }}</span>
@@ -6894,6 +6896,16 @@ def ensure_issue_reports_table(conn):
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             INDEX idx_user (user_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
+        # 幂等添加 IP 定位列
+        cur.execute("SHOW COLUMNS FROM issue_reports LIKE 'reporter_ip'")
+        if not cur.fetchone():
+            cur.execute("ALTER TABLE issue_reports ADD COLUMN reporter_ip VARCHAR(64) DEFAULT NULL AFTER created_at")
+        cur.execute("SHOW COLUMNS FROM issue_reports LIKE 'reporter_province'")
+        if not cur.fetchone():
+            cur.execute("ALTER TABLE issue_reports ADD COLUMN reporter_province VARCHAR(50) DEFAULT NULL AFTER reporter_ip")
+        cur.execute("SHOW COLUMNS FROM issue_reports LIKE 'reporter_city'")
+        if not cur.fetchone():
+            cur.execute("ALTER TABLE issue_reports ADD COLUMN reporter_city VARCHAR(50) DEFAULT NULL AFTER reporter_province")
     conn.commit()
 
 def ensure_task_ratings_table(conn):
@@ -7351,15 +7363,21 @@ def user_report():
             if not title:
                 flash("请填写问题标题", "danger")
                 return redirect(url_for("user_report"))
+            client_ip = request.headers.get("X-Forwarded-For", request.remote_addr) or ""
+            if "," in client_ip:
+                client_ip = client_ip.split(",")[0].strip()
+            rep_prov, rep_city = _ip_to_province_city(client_ip)
             with conn.cursor() as cur:
                 cur.execute(
                     """INSERT INTO issue_reports
                        (user_id, title, description, fault_type, fault_phenomenon,
-                        customer_address, contact_name, contact_phone)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        customer_address, contact_name, contact_phone,
+                        reporter_ip, reporter_province, reporter_city)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                     (current_user["user_id"], title, description or None,
                      fault_type or None, fault_phenomenon or None,
-                     customer_address or None, contact_name or None, contact_phone or None)
+                     customer_address or None, contact_name or None, contact_phone or None,
+                     client_ip or None, rep_prov or None, rep_city or None)
                 )
                 report_id = cur.lastrowid
             conn.commit()
