@@ -2007,23 +2007,48 @@ def api_task_image_delete(task_id, image_id):
 def _ip_to_province_city(client_ip):
     """通过IP查询省市，返回 (province, city) 或 (None, None)"""
     import urllib.request as _urlreq
+    if not client_ip:
+        return None, None
     if "," in client_ip:
         client_ip = client_ip.split(",")[0].strip()
-    if client_ip in ("127.0.0.1", "::1") or client_ip.startswith("192.168.") or client_ip.startswith("10."):
-        client_ip = ""
+    if client_ip in ("127.0.0.1", "::1") or client_ip.startswith("192.168.") or client_ip.startswith("10.") or client_ip.startswith("172."):
+        return None, None
+
+    def _strip_suffix(s, suffixes):
+        for suf in suffixes:
+            s = s.replace(suf, "")
+        return s
+
+    # 主：ip-api.com（免费，支持中文）
     try:
         url = f"http://ip-api.com/json/{client_ip}?lang=zh-CN&fields=status,regionName,city"
-        req = _urlreq.Request(url, headers={"User-Agent": "TelecomMaintenance/1.0"})
-        with _urlreq.urlopen(req, timeout=4) as resp:
-            result = json.loads(resp.read().decode())
-        if result.get("status") == "success":
-            province = result.get("regionName", "")
-            for s in ("省", "自治区", "特别行政区", "壮族", "回族", "维吾尔"):
-                province = province.replace(s, "")
-            city = result.get("city", "").replace("市", "")
-            return province or None, city or None
+        req = _urlreq.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+        with _urlreq.urlopen(req, timeout=5) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        if raw.lstrip().startswith("{"):
+            result = json.loads(raw)
+            if result.get("status") == "success":
+                prov = _strip_suffix(result.get("regionName", ""), ["省", "自治区", "特别行政区", "壮族", "回族", "维吾尔"])
+                city = result.get("city", "").replace("市", "")
+                return prov or None, city or None
     except Exception:
         pass
+
+    # 备用：ipapi.co
+    try:
+        url2 = f"https://ipapi.co/{client_ip}/json/"
+        req2 = _urlreq.Request(url2, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+        with _urlreq.urlopen(req2, timeout=5) as resp2:
+            raw2 = resp2.read().decode("utf-8", errors="replace")
+        if raw2.lstrip().startswith("{"):
+            result2 = json.loads(raw2)
+            if not result2.get("error"):
+                prov2 = _strip_suffix(result2.get("region", ""), ["省", "自治区", "特别行政区", "壮族", "回族", "维吾尔"])
+                city2 = result2.get("city", "").replace("市", "")
+                return prov2 or None, city2 or None
+    except Exception:
+        pass
+
     return None, None
 
 
