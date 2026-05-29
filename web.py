@@ -2063,6 +2063,17 @@ def api_ip_location():
     return jsonify({"ok": False, "message": "IP定位失败"})
 
 
+@app.route("/user/api/ip_location")
+def user_api_ip_location():
+    if not get_end_user():
+        return jsonify({"ok": False, "message": "请先登录"}), 401
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr) or ""
+    prov, ct = _ip_to_province_city(client_ip)
+    if prov or ct:
+        return jsonify({"ok": True, "province": prov or "", "city": ct or ""})
+    return jsonify({"ok": False, "message": "IP定位失败"})
+
+
 @app.route("/api/staff/location", methods=["POST"])
 def api_staff_location():
     """员工更新实时位置（GPS坐标和/或省市）"""
@@ -7158,7 +7169,7 @@ function onTaskCityChange(){updateAddr();}
 function updateAddr(){var p=document.getElementById('task_province').value,c=document.getElementById('task_city').value,d=document.getElementById('task_detail').value;document.getElementById('customer_address').value=(p||'')+(c||'')+(d||'');}
 document.getElementById('task_detail').addEventListener('input',updateAddr);
 (function(){var s=document.getElementById('task_province');Object.keys(PC).forEach(function(p){var o=document.createElement('option');o.value=p;o.textContent=p;s.appendChild(o);});})();
-function getLocation(){var st=document.getElementById('loc-status');st.textContent='定位中...';st.style.color='#6b7280';fetch('/api/ip_location').then(function(r){return r.json();}).then(function(d){if(!d.ok)throw new Error(d.message);var pSel=document.getElementById('task_province');pSel.value=d.province||'';onTaskProvinceChange();setTimeout(function(){document.getElementById('task_city').value=d.city||'';updateAddr();},50);st.textContent='定位成功：'+(d.province||'')+(d.city||'');st.style.color='#065f46';}).catch(function(e){st.textContent='定位失败：'+e.message;st.style.color='#991b1b';});}
+function getLocation(){var st=document.getElementById('loc-status');st.textContent='定位中...';st.style.color='#6b7280';fetch('/user/api/ip_location').then(function(r){return r.json();}).then(function(d){if(!d.ok)throw new Error(d.message);var pSel=document.getElementById('task_province');pSel.value=d.province||'';onTaskProvinceChange();setTimeout(function(){document.getElementById('task_city').value=d.city||'';updateAddr();},50);st.textContent='定位成功：'+(d.province||'')+(d.city||'');st.style.color='#065f46';}).catch(function(e){st.textContent='定位失败：'+e.message;st.style.color='#991b1b';});}
 </script>''' + _EU_SWITCH_BTN + '''</body></html>'''
 
 EU_MY_REPORTS_HTML = '''<!DOCTYPE html>
