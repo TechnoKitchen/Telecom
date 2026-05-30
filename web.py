@@ -2364,16 +2364,27 @@ def tasks_page():
         if get_current_role_level() == 1:
             current_staff_id = session.get("staff_id")
             if current_staff_id:
-                where_parts.append("(t.assigned_staff_id = %s OR t.status = '待派单' OR (t.helper_staff_id = %s AND t.helper_status IN ('pending','accepted')))")
-                params.extend([current_staff_id, current_staff_id])
+                if status_filter in TASK_STATUSES:
+                    # 状态筛选合并进权限条件，避免 AND 互斥
+                    where_parts.append("(t.assigned_staff_id = %s OR t.status = '待派单' OR (t.helper_staff_id = %s AND t.helper_status IN ('pending','accepted'))) AND t.status = %s")
+                    params.extend([current_staff_id, current_staff_id, status_filter])
+                else:
+                    where_parts.append("(t.assigned_staff_id = %s OR t.status = '待派单' OR (t.helper_staff_id = %s AND t.helper_status IN ('pending','accepted')))")
+                    params.extend([current_staff_id, current_staff_id])
+                    status_filter = ""
             else:
-                where_parts.append("t.status = '待派单'")
-
-        if status_filter in TASK_STATUSES:
-            where_parts.append("t.status = %s")
-            params.append(status_filter)
+                if status_filter in TASK_STATUSES:
+                    where_parts.append("t.status = '待派单' AND t.status = %s")
+                    params.append(status_filter)
+                else:
+                    where_parts.append("t.status = '待派单'")
+                    status_filter = ""
         else:
-            status_filter = ""
+            if status_filter in TASK_STATUSES:
+                where_parts.append("t.status = %s")
+                params.append(status_filter)
+            else:
+                status_filter = ""
 
         if priority_filter in TASK_PRIORITIES:
             where_parts.append("t.priority = %s")
@@ -7005,7 +7016,7 @@ EU_PC_DATA = {
 EU_FAULT_TYPES_NEED_PHENOMENON = {"宽带修障", "IPTV修障", "电话修障", "线路维护"}
 
 # ── 切换按钮片段（注入到所有用户端页面） ─────────────────
-_EU_SWITCH_BTN = '''<a href="/tasks" style="position:fixed;bottom:20px;right:20px;z-index:9999;background:#2c3e50;color:#fff;padding:8px 16px;border-radius:20px;font-size:13px;text-decoration:none;box-shadow:0 2px 8px rgba(0,0,0,0.25);">🔧 工程师端</a>'''
+_EU_SWITCH_BTN = '''<a href="/user/switch_to_staff" style="position:fixed;bottom:20px;right:20px;z-index:9999;background:#2c3e50;color:#fff;padding:8px 16px;border-radius:20px;font-size:13px;text-decoration:none;box-shadow:0 2px 8px rgba(0,0,0,0.25);">🔧 工程师端</a>'''
 
 # ── 用户端 CSS ────────────────────────────────────────────
 _EU_BASE_CSS = """
@@ -7115,6 +7126,7 @@ EU_REPORT_HTML = '''<!DOCTYPE html>
     <div class="header-right">
         <span>{{ current_user.real_name }}</span>
         <a href="{{ url_for('user_my_reports') }}">我的上报</a>
+        <a href="{{ url_for('user_profile') }}">个人信息</a>
         <a href="{{ url_for('user_logout') }}">退出</a>
     </div>
 </header>
@@ -7127,9 +7139,9 @@ EU_REPORT_HTML = '''<!DOCTYPE html>
         <div class="section-title" style="border-top:none;padding-top:0;margin-top:0;">联系信息</div>
         <div class="row">
             <div class="form-group"><label>联系人姓名 <span class="required">*</span></label>
-                <input type="text" name="contact_name" maxlength="30" placeholder="您的姓名" required></div>
+                <input type="text" name="contact_name" maxlength="30" placeholder="您的姓名" value="{{ current_user.real_name }}" required></div>
             <div class="form-group"><label>联系电话 <span class="required">*</span></label>
-                <input type="tel" name="contact_phone" maxlength="20" placeholder="手机号码" required></div>
+                <input type="tel" name="contact_phone" maxlength="20" placeholder="手机号码" value="{{ current_user.phone }}" required></div>
         </div>
         <div class="section-title">故障信息</div>
         <div class="form-group"><label>业务类型 <span class="required">*</span></label>
@@ -7181,6 +7193,7 @@ EU_MY_REPORTS_HTML = '''<!DOCTYPE html>
     <div class="header-right">
         <span>{{ current_user.real_name }}</span>
         <a href="{{ url_for('user_report') }}">提交上报</a>
+        <a href="{{ url_for('user_profile') }}">个人信息</a>
         <a href="{{ url_for('user_logout') }}">退出</a>
     </div>
 </header>
@@ -7258,6 +7271,7 @@ EU_RATE_HTML = '''<!DOCTYPE html>
     <div class="header-right">
         <span>{{ current_user.real_name }}</span>
         <a href="{{ url_for('user_my_reports') }}">我的上报</a>
+        <a href="{{ url_for('user_profile') }}">个人信息</a>
         <a href="{{ url_for('user_logout') }}">退出</a>
     </div>
 </header>
@@ -7290,6 +7304,14 @@ EU_RATE_HTML = '''<!DOCTYPE html>
 
 
 # ── 用户端路由 ────────────────────────────────────────────
+@app.route("/user/switch_to_staff")
+def user_switch_to_staff():
+    session.pop("eu_id", None)
+    session.pop("eu_name", None)
+    session.pop("eu_phone", None)
+    return redirect(url_for("tasks_page"))
+
+
 @app.route("/user/")
 def user_index():
     if get_end_user():
@@ -7523,6 +7545,108 @@ def user_rate_task(task_id):
     finally:
         conn.close()
     return render_template_string(EU_RATE_HTML, current_user=current_user, task=task)
+
+
+EU_PROFILE_HTML = '''<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>个人信息 - 装维报修</title><style>''' + _EU_BASE_CSS + '''</style></head>
+<body>
+<header>
+    <div><h1>装维报修平台</h1><p>个人信息</p></div>
+    <div class="header-right">
+        <span>{{ current_user.real_name }}</span>
+        <a href="{{ url_for('user_my_reports') }}">我的上报</a>
+        <a href="{{ url_for('user_logout') }}">退出</a>
+    </div>
+</header>
+<div class="container">
+{% with messages = get_flashed_messages(with_categories=true) %}
+{% if messages %}{% for cat, msg in messages %}<div class="flash flash-{{ cat }}">{{ msg }}</div>{% endfor %}{% endif %}
+{% endwith %}
+<div class="card">
+    <h2 style="margin:0 0 16px;font-size:18px;">个人信息</h2>
+    <form method="post">
+        <div class="row">
+            <div class="form-group">
+                <label>真实姓名 <span class="required">*</span></label>
+                <input type="text" name="real_name" maxlength="50" value="{{ current_user.real_name }}" required>
+            </div>
+            <div class="form-group">
+                <label>手机号码 <span class="required">*</span></label>
+                <input type="tel" name="phone" maxlength="20" value="{{ current_user.phone }}" required>
+            </div>
+        </div>
+        <div class="row">
+            <div class="form-group">
+                <label>用户名</label>
+                <input type="text" value="{{ current_user.username }}" disabled style="background:#f3f4f6;color:#6b7280;">
+            </div>
+        </div>
+        <div class="section-title">修改密码（不修改请留空）</div>
+        <div class="row">
+            <div class="form-group">
+                <label>当前密码</label>
+                <input type="password" name="old_password" placeholder="请输入当前密码">
+            </div>
+            <div class="form-group">
+                <label>新密码</label>
+                <input type="password" name="new_password" placeholder="至少6位">
+            </div>
+        </div>
+        <button type="submit" class="btn btn-primary" style="margin-top:8px;">保存修改</button>
+        <a href="{{ url_for('user_my_reports') }}" class="btn" style="margin-top:8px;margin-left:8px;background:#6b7280;">返回</a>
+    </form>
+</div></div>
+''' + _EU_SWITCH_BTN + '''</body></html>'''
+
+
+@app.route("/user/profile", methods=["GET", "POST"])
+@require_end_user
+def user_profile():
+    current_user = get_end_user()
+    if request.method == "POST":
+        real_name = request.form.get("real_name", "").strip()
+        phone = request.form.get("phone", "").strip()
+        old_password = request.form.get("old_password", "")
+        new_password = request.form.get("new_password", "")
+        if not real_name:
+            flash("姓名不能为空", "danger")
+            return redirect(url_for("user_profile"))
+        if not phone or len(phone) != 11 or not phone.isdigit():
+            flash("请输入正确的11位手机号码", "danger")
+            return redirect(url_for("user_profile"))
+        conn = get_db_connection()
+        if not conn:
+            flash("数据库连接失败", "danger")
+            return redirect(url_for("user_profile"))
+        try:
+            with conn.cursor() as cur:
+                if new_password:
+                    if len(new_password) < 6:
+                        flash("新密码至少6位", "danger")
+                        return redirect(url_for("user_profile"))
+                    cur.execute("SELECT password FROM end_users WHERE user_id=%s", (current_user["user_id"],))
+                    row = cur.fetchone()
+                    if not row or not _check_eu_password(old_password, row["password"]):
+                        flash("当前密码错误", "danger")
+                        return redirect(url_for("user_profile"))
+                    cur.execute(
+                        "UPDATE end_users SET real_name=%s, phone=%s, password=%s WHERE user_id=%s",
+                        (real_name, phone, _hash_eu_password(new_password), current_user["user_id"])
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE end_users SET real_name=%s, phone=%s WHERE user_id=%s",
+                        (real_name, phone, current_user["user_id"])
+                    )
+            conn.commit()
+            session["eu_name"] = real_name
+            session["eu_phone"] = phone
+            flash("个人信息已更新", "success")
+            return redirect(url_for("user_profile"))
+        finally:
+            conn.close()
+    return render_template_string(EU_PROFILE_HTML, current_user=current_user)
 
 
 if __name__ == '__main__':
