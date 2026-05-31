@@ -337,6 +337,9 @@ def ensure_maintenance_tasks_table(connection):
     cur.execute("SHOW COLUMNS FROM maintenance_tasks LIKE 'overdue_at'")
     if not cur.fetchone():
         cur.execute("ALTER TABLE maintenance_tasks ADD COLUMN overdue_at DATETIME NULL")
+    cur.execute("SHOW COLUMNS FROM maintenance_tasks LIKE 'low_satisfaction'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE maintenance_tasks ADD COLUMN low_satisfaction TINYINT(1) NOT NULL DEFAULT 0")
     cur.execute("""
         CREATE TABLE IF NOT EXISTS task_suspend_log (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -475,22 +478,6 @@ def _get_return_rate(cursor, staff_id):
     return return_cnt, assigned_cnt, rate
 
 
-def _get_suspend_rate(cursor, staff_id):
-    """返回 (suspend_cnt, assigned_cnt, rate) 最近30天"""
-    cursor.execute(
-        "SELECT COUNT(*) AS cnt FROM task_suspend_log WHERE staff_id=%s AND suspended_at >= DATE_SUB(NOW(), INTERVAL 10 SECOND)",
-        (staff_id,),
-    )
-    suspend_cnt = int((cursor.fetchone() or {}).get("cnt") or 0)
-    cursor.execute(
-        "SELECT COUNT(*) AS cnt FROM maintenance_tasks WHERE assigned_staff_id=%s AND assigned_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)",
-        (staff_id,),
-    )
-    assigned_cnt = int((cursor.fetchone() or {}).get("cnt") or 0)
-    rate = suspend_cnt / assigned_cnt if assigned_cnt > 0 else 0.0
-    return suspend_cnt, assigned_cnt, rate
-
-
 def check_overdue_tasks():
     """定时任务：检查三类超时工单并自动转派，对原执行人记录退回惩罚"""
     connection = get_db_connection()
@@ -612,7 +599,7 @@ def _auto_assign_staff(cursor, fault_type, task_lat, task_lng, task_address="", 
 
     max_tasks = max(r["active_tasks"] for r in rows) or 1
 
-    best, best_score = None, float("inf")
+    best, best_score = None, float("-inf")
     for r in rows:
         dept_score = 0.0 if (target_dept and r["department"] == target_dept) else 1.0
         # 省市匹配：同省同市=0，同省不同市=0.5，不同省或无位置=1，员工无位置记录=0.8
@@ -630,12 +617,9 @@ def _auto_assign_staff(cursor, fault_type, task_lat, task_lng, task_address="", 
             loc_score = 0.8  # 无位置记录，劣于有位置匹配的员工
         task_score = r["active_tasks"] / max_tasks
         r_cnt, _r_assigned, r_rate = _get_return_rate(cursor, r["staff_id"])
-        sp_cnt, _sp_assigned, sp_rate = _get_suspend_rate(cursor, r["staff_id"])
         return_penalty = min(r_rate * 2, 1.0)
-        suspend_penalty = min(sp_rate * 2, 1.0)
-        penalty = (return_penalty + suspend_penalty) / 2
-        score = dept_score * 0.32 + loc_score * 0.24 + task_score * 0.24 + penalty * 0.20
-        if score < best_score:
+        score = dept_score * 0.35 + loc_score * 0.25 + task_score * 0.25 - return_penalty * 0.15
+        if score > best_score:
             best_score = score
             best = r
 
@@ -924,6 +908,16 @@ def _fetch_task_stat_summary(cursor, start_dt, end_dt):
     total = int(raw.get("total") or 0)
     done = int(raw.get("done") or 0)
     cancelled = int(raw.get("cancelled") or 0)
+
+    # 退回次数和退回率
+    cursor.execute(
+        "SELECT COUNT(*) AS cnt FROM task_return_log WHERE returned_at >= %s AND returned_at <= %s",
+        (start_dt, end_dt),
+    )
+    return_cnt = int((cursor.fetchone() or {}).get("cnt") or 0)
+    assigned = int(raw.get("assigned") or 0) + done + int(raw.get("in_progress") or 0) + int(raw.get("awaiting_receipt") or 0)
+    return_rate_pct = round(return_cnt / assigned * 100, 1) if assigned > 0 else None
+
     return {
         "total": total,
         "done": done,
@@ -934,6 +928,8 @@ def _fetch_task_stat_summary(cursor, start_dt, end_dt):
         "awaiting_receipt": int(raw.get("awaiting_receipt") or 0),
         "effective": total - cancelled,
         "completion_pct": _completion_rate(done, total, cancelled),
+        "return_cnt": return_cnt,
+        "return_rate_pct": return_rate_pct,
     }
 
 
@@ -1067,6 +1063,18 @@ def build_task_statistics(cursor, filters):
     if filters["view"] == "region":
         rows = _apply_region_density(rows)
 
+    # staff 视图补充退回次数和退回率
+    if filters["view"] == "staff":
+        for row in rows:
+            sid = row.get("staff_id")
+            if sid:
+                rc, ac, rt = _get_return_rate(cursor, sid)
+                row["return_cnt"] = rc
+                row["return_rate_pct"] = round(rt * 100, 1) if ac > 0 else None
+            else:
+                row["return_cnt"] = 0
+                row["return_rate_pct"] = None
+
     chart_limit = 20 if filters["view"] == "time" else 15
     chart_rows = rows[-chart_limit:] if filters["view"] == "time" else rows[:chart_limit]
 
@@ -1170,6 +1178,8 @@ def _stat_table_columns(view, period):
             {"key": "total", "title": "工单量"},
             {"key": "done", "title": "已完成"},
             {"key": "completion_pct", "title": "完成率(%)"},
+            {"key": "return_cnt", "title": "退回次数"},
+            {"key": "return_rate_pct", "title": "退回率(%)"},
         ]
     if view == "team":
         return [
@@ -2641,15 +2651,13 @@ def staff_page():
                 cursor.execute("SELECT * FROM staff_basic_info ORDER BY staff_id LIMIT 100")
 
         staff_list = cursor.fetchall()
-        # 批量查询退回率和挂起率（管理员视图）
+        # 批量查询退回率（管理员视图）
         return_rates = {}
         suspend_rates = {}
         if user and user.get('role_level', 1) >= 2:
             for s in staff_list:
                 rc, ac, rt = _get_return_rate(cursor, s['staff_id'])
                 return_rates[s['staff_id']] = {'cnt': rc, 'assigned': ac, 'rate': rt}
-                sc, _, st = _get_suspend_rate(cursor, s['staff_id'])
-                suspend_rates[s['staff_id']] = {'cnt': sc, 'rate': st}
         cursor.close()
         connection.close()
         return render_template_string(STAFF_PAGE_HTML, staff_list=staff_list, return_rates=return_rates, suspend_rates=suspend_rates)
@@ -3164,7 +3172,7 @@ def add_task():
             # 关联上报记录：更新 issue_report 状态为处理中
             if source_report_id:
                 cursor.execute(
-                    "UPDATE issue_reports SET status='处理中' WHERE report_id=%s",
+                    "UPDATE issue_reports SET status='已转工单' WHERE report_id=%s",
                     (source_report_id,)
                 )
 
@@ -3837,12 +3845,6 @@ def suspend_task(task_id):
             flash("挂起原因不能为空", "warning")
             return redirect(url_for("task_detail", task_id=task_id))
 
-        # 挂起次数检查（最近30天≥3次且挂起率>20%则禁止）
-        suspend_cnt, s_assigned_cnt, s_rate = _get_suspend_rate(cursor, staff_id)
-        if suspend_cnt >= 3 and s_rate > 0.20:
-            flash(f"您最近30天挂起率为 {s_rate*100:.0f}%（{suspend_cnt}/{s_assigned_cnt}），已超过限制，无法挂起工单", "danger")
-            return redirect(url_for("task_detail", task_id=task_id))
-
         cursor.execute(
             "UPDATE maintenance_tasks SET status='已挂起', suspended_at=NOW(), suspended_by=%s, suspend_reason=%s, updated_at=NOW() WHERE task_id=%s AND status='处理中'",
             (staff_id, reason, task_id),
@@ -3952,10 +3954,16 @@ def issue_reports_admin():
             reports = []
             for row in raw:
                 row = dict(row)
-                if row.get("linked_task_status"):
-                    row["display_status"] = row["linked_task_status"]
+                linked_status = row.get("linked_task_status")
+                report_status = row.get("status") or "待处理"
+                if linked_status in ("已完成", "已归档"):
+                    row["display_status"] = linked_status
+                elif linked_status:
+                    row["display_status"] = "处理中"
+                elif report_status == "已转工单":
+                    row["display_status"] = "已转工单"
                 else:
-                    row["display_status"] = row["status"]
+                    row["display_status"] = "待处理"
                 reports.append(row)
     except Exception:
         reports = []
@@ -4038,7 +4046,8 @@ ISSUE_REPORTS_ADMIN_HTML = '''<!DOCTYPE html>
                     {% if r.reporter_province or r.reporter_city %}{{ r.reporter_province or '' }}{{ r.reporter_city or '' }}{% else %}—{% endif %}
                 </td>
                 <td>
-                    {% if r.display_status == 'pending' %}<span class="pill pill-pending">待处理</span>
+                    {% if r.display_status == '待处理' %}<span class="pill pill-pending">待处理</span>
+                    {% elif r.display_status == '已转工单' %}<span class="pill" style="background:#e0e7ff;color:#3730a3;">已转工单</span>
                     {% elif r.display_status in ('已派单', '处理中', '待回执') %}<span class="pill pill-processing">{{ r.display_status }}</span>
                     {% elif r.display_status == '已归档' %}<span class="pill" style="background:#e0e7ff;color:#3730a3;">已归档</span>
                     {% elif r.display_status in ('已完成',) %}<span class="pill pill-done">已完成</span>
@@ -4363,6 +4372,16 @@ TASK_STATISTICS_HTML = '''
                     <p class="summary-label">待回执</p>
                     <p class="summary-value">{{ stat.summary.awaiting_receipt or 0 }}</p>
                 </div>
+                <div class="summary-item">
+                    <p class="summary-label">退回次数</p>
+                    <p class="summary-value">{{ stat.summary.return_cnt }}</p>
+                </div>
+                <div class="summary-item">
+                    <p class="summary-label">退回率</p>
+                    <p class="summary-value" style="color:{% if stat.summary.return_rate_pct and stat.summary.return_rate_pct > 20 %}#dc2626{% elif stat.summary.return_rate_pct and stat.summary.return_rate_pct > 10 %}#d97706{% else %}#15803d{% endif %};">
+                        {% if stat.summary.return_rate_pct is not none %}{{ stat.summary.return_rate_pct }}%{% else %}—{% endif %}
+                    </p>
+                </div>
             </div>
         </div>
 
@@ -4395,6 +4414,10 @@ TASK_STATISTICS_HTML = '''
                     <td>
                         {% if col.key == 'completion_pct' %}
                             {% if row.completion_pct is not none %}{{ row.completion_pct }}%{% else %}—{% endif %}
+                        {% elif col.key == 'return_rate_pct' %}
+                            {% if row.return_rate_pct is not none %}
+                            <span style="color:{% if row.return_rate_pct > 20 %}#dc2626{% elif row.return_rate_pct > 10 %}#d97706{% else %}#15803d{% endif %};">{{ row.return_rate_pct }}%</span>
+                            {% else %}—{% endif %}
                         {% elif col.key == 'density_pct' %}
                             {% if row.density_pct is not none %}{{ row.density_pct }}%{% else %}—{% endif %}
                         {% elif col.key == 'team_id' or col.key == 'region_id' %}
@@ -5038,7 +5061,7 @@ STAFF_PAGE_HTML = '''
                     <th>位置</th>
                     <th>入职日期</th>
                     <th>在职状态</th>
-                    {% if current_user and current_user.role_level >= 2 %}<th>退回率(30天)</th><th>挂起率(30天)</th>{% endif %}
+                    {% if current_user and current_user.role_level >= 2 %}<th>退回率(30天)</th>{% endif %}
                     <th>操作</th>
                 </tr>
                 </thead>
@@ -5058,10 +5081,6 @@ STAFF_PAGE_HTML = '''
                     <td>{% set rr = return_rates.get(staff.staff_id, {}) %}{% if rr.cnt %}
                         <span style="color:{% if rr.rate > 0.2 %}#dc2626{% elif rr.rate > 0.1 %}#d97706{% else %}#15803d{% endif %};">{{ (rr.rate*100)|int }}%</span>
                         <small style="color:#9ca3af;">（{{ rr.cnt }}/{{ rr.assigned }}）</small>
-                    {% else %}—{% endif %}</td>
-                    <td>{% set sr = suspend_rates.get(staff.staff_id, {}) %}{% if sr.cnt %}
-                        <span style="color:{% if sr.rate > 0.2 %}#dc2626{% elif sr.rate > 0.1 %}#d97706{% else %}#15803d{% endif %};">{{ (sr.rate*100)|int }}%</span>
-                        <small style="color:#9ca3af;">（{{ sr.cnt }}次）</small>
                     {% else %}—{% endif %}</td>
                     {% endif %}
                     <td class="action-buttons">
@@ -6939,7 +6958,7 @@ def ensure_issue_reports_table(conn):
             customer_address VARCHAR(300),
             contact_name VARCHAR(50),
             contact_phone VARCHAR(20),
-            status VARCHAR(20) NOT NULL DEFAULT 'pending',
+            status VARCHAR(20) NOT NULL DEFAULT '待处理',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             INDEX idx_user (user_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
@@ -7215,7 +7234,8 @@ EU_MY_REPORTS_HTML = '''<!DOCTYPE html>
             <td>{{ r.contact_name or '—' }}{% if r.contact_phone %} {{ r.contact_phone }}{% endif %}</td>
             <td style="white-space:nowrap;">{{ r.created_at.strftime('%Y-%m-%d %H:%M') if r.created_at else '—' }}</td>
             <td>
-                {% if r.display_status == 'pending' %}<span class="pill pill-pending">待处理</span>
+                {% if r.display_status == '待处理' %}<span class="pill pill-pending">待处理</span>
+                {% elif r.display_status == '已转工单' %}<span class="pill" style="background:#e0e7ff;color:#3730a3;">已转工单</span>
                 {% elif r.display_status == '处理中' %}<span class="pill" style="background:#dbeafe;color:#1e40af;">处理中</span>
                 {% elif r.display_status == '已完成' %}<span class="pill pill-done">已完成</span>
                 {% elif r.display_status == '已归档' %}<span class="pill pill-archived">已归档</span>
@@ -7465,10 +7485,13 @@ def user_my_reports():
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT r.*, t.task_id AS linked_task_id, t.status AS linked_task_status,
-                       t.rating_stars
+                SELECT r.*, u.real_name AS user_real_name,
+                       t.task_id AS linked_task_id, t.status AS linked_task_status,
+                       tr.stars AS rating_stars
                 FROM issue_reports r
+                LEFT JOIN end_users u ON r.user_id = u.user_id
                 LEFT JOIN maintenance_tasks t ON t.source_report_id = r.report_id
+                LEFT JOIN task_ratings tr ON tr.task_id = t.task_id
                 WHERE r.user_id=%s ORDER BY r.created_at DESC
             """, (uid,))
             rows = cur.fetchall()
@@ -7476,7 +7499,15 @@ def user_my_reports():
             for r in rows:
                 r = dict(r)
                 linked_status = r.get("linked_task_status")
-                r["display_status"] = linked_status if linked_status else r["status"]
+                report_status = r.get("status") or "待处理"
+                if linked_status in ("已完成", "已归档"):
+                    r["display_status"] = linked_status
+                elif linked_status:
+                    r["display_status"] = "处理中"
+                elif report_status == "已转工单":
+                    r["display_status"] = "已转工单"
+                else:
+                    r["display_status"] = "待处理"
                 r["ratable_task_id"] = (
                     r["linked_task_id"]
                     if r.get("linked_task_id") and linked_status == "已完成" and not r.get("rating_stars")
@@ -7484,10 +7515,12 @@ def user_my_reports():
                 )
                 reports.append(r)
             cur.execute("""
-                SELECT t.task_id, t.title, t.status, t.rating_stars, t.rating_comment, t.rated_at
+                SELECT t.task_id, t.title, t.status,
+                       tr.stars AS rating_stars, tr.comment AS rating_comment, tr.rated_at
                 FROM maintenance_tasks t
-                WHERE t.reporter_user_id=%s AND t.rating_stars IS NOT NULL
-                ORDER BY t.rated_at DESC
+                JOIN task_ratings tr ON tr.task_id = t.task_id
+                WHERE t.reporter_user_id=%s
+                ORDER BY tr.rated_at DESC
             """, (uid,))
             rated_tasks = cur.fetchall()
     finally:
@@ -7517,7 +7550,11 @@ def user_rate_task(task_id):
         if task.get("status") != "已完成":
             flash("工单尚未完成，无法评价", "warning")
             return redirect(url_for("user_my_reports"))
-        if task.get("rating_stars") is not None:
+        # 已评价判断：查 task_ratings 表
+        with conn.cursor() as cur:
+            cur.execute("SELECT rating_id FROM task_ratings WHERE task_id=%s", (task_id,))
+            already_rated = cur.fetchone()
+        if already_rated:
             flash("该工单已评价", "warning")
             return redirect(url_for("user_my_reports"))
         if request.method == "POST":
@@ -7529,18 +7566,23 @@ def user_rate_task(task_id):
                 flash("请选择1-5星评分", "danger")
                 return redirect(url_for("user_rate_task", task_id=task_id))
             comment = request.form.get("comment", "").strip()
+            low_sat = 1 if stars < 5 else 0
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO task_ratings (task_id, user_id, stars, comment) VALUES (%s,%s,%s,%s)",
                     (task_id, uid, stars, comment or None)
                 )
-                new_status = "已归档" if stars == 5 else "已完成"
                 cur.execute(
-                    "UPDATE maintenance_tasks SET rating_stars=%s, rating_comment=%s, rated_at=NOW(), status=%s WHERE task_id=%s",
-                    (stars, comment or None, new_status, task_id)
+                    "UPDATE maintenance_tasks SET status='已归档', low_satisfaction=%s WHERE task_id=%s",
+                    (low_sat, task_id)
                 )
             conn.commit()
-            flash("感谢您的五星好评！工单已归档" if stars == 5 else f"评价已提交（{stars}星）", "success")
+            if stars == 5:
+                flash("感谢您的五星好评！工单已归档", "success")
+            elif stars <= 2:
+                flash(f"评价已提交（{stars}星），我们会尽快跟进改善", "success")
+            else:
+                flash(f"评价已提交（{stars}星），工单已归档", "success")
             return redirect(url_for("user_my_reports"))
     finally:
         conn.close()
